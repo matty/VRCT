@@ -2,17 +2,16 @@ import requests
 from langchain_ollama import ChatOllama
 
 try:
-    from .translation_languages import translation_lang
     from .translation_model_list import RecentModelList
     from .translation_llm_base import LLMTranslationMixin
 except Exception:
     import sys
     from os import path as os_path
     sys.path.append(os_path.dirname(os_path.abspath(__file__)))
-    from translation_languages import translation_lang, loadTranslationLanguages
+    from translation_languages import loadTranslationLanguages
     from translation_model_list import RecentModelList
     from translation_llm_base import LLMTranslationMixin
-    translation_lang = loadTranslationLanguages(path=".", force=True)
+    loadTranslationLanguages(path=".", force=True)
 
 _KEEP_ALIVE = "30m"
 

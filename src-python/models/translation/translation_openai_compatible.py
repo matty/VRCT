@@ -1,15 +1,14 @@
 from openai import OpenAI
 
 try:
-    from .translation_languages import translation_lang
     from .translation_openai import OpenAIClient, _fetch_models
 except Exception:
     import sys
     from os import path as os_path
     sys.path.append(os_path.dirname(os_path.dirname(os_path.dirname(os_path.abspath(__file__)))))
-    from translation_languages import translation_lang, loadTranslationLanguages
+    from translation_languages import loadTranslationLanguages
     from translation_openai import OpenAIClient, _fetch_models
-    translation_lang = loadTranslationLanguages(path=".", force=True)
+    loadTranslationLanguages(path=".", force=True)
 
 
 # 除外対象のキーワード（互換エンドポイントでもテキスト翻訳に不適なモデルは弾く）
