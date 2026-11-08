@@ -1,3 +1,5 @@
+import threading
+
 import requests
 from langchain_ollama import ChatOllama
 
@@ -14,6 +16,8 @@ except Exception:
     loadTranslationLanguages(path=".", force=True)
 
 _KEEP_ALIVE = "30m"
+# 大きなモデルを HDD から読むと数十秒かかる
+_PRELOAD_TIMEOUT_SECONDS = 300
 
 def _authentication_check(base_url: str | None = None) -> bool:
     """Check authentication for Ollama API.
@@ -75,6 +79,31 @@ class OllamaClient(LLMTranslationMixin, RecentModelList):
             # アンロードされ、次の発言の翻訳でモデルの再ロード (数秒) を待つ
             keep_alive=_KEEP_ALIVE,
         )
+        self._preloadModel()
+
+    def _preloadModel(self) -> None:
+        """選んだモデルを Ollama に先に読み込ませる (バックグラウンド)。
+
+        Ollama は最初のリクエストが来てからモデルをロードするため、モデルを
+        選んだ直後の最初の発言の翻訳だけ数秒〜数十秒待たされていた。
+        prompt を付けない /api/generate はモデルのロードだけを行う
+        (Ollama の公式な事前ロードの方法)。失敗しても翻訳時にロードされるだけ。
+        """
+        model, base_url = self.model, self.base_url
+        if not model:
+            return
+
+        def preload() -> None:
+            try:
+                requests.post(
+                    f"{base_url}/api/generate",
+                    json={"model": model, "keep_alive": _KEEP_ALIVE},
+                    timeout=_PRELOAD_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=preload, name="ollama-preload", daemon=True).start()
 
     def translate(self, text: str, input_lang: str, output_lang: str) -> str:
         return self._translateWith(self.openai_llm, text, input_lang, output_lang)
