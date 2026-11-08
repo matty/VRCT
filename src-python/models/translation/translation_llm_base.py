@@ -65,6 +65,108 @@ _THINK_CLOSE_RE = re.compile(r"</(think|thinking|reasoning)>", re.IGNORECASE)
 _LABEL_RE = re.compile(r"^(?:translation|translated text|output)\s*[:：]\s*", re.IGNORECASE)
 
 
+# --- 翻訳専用モデルのプロファイル -------------------------------------------
+# Ollama / LM Studio 等で動かせる翻訳専用のローカルモデルは、学習時の固定の
+# プロンプト形式から外れると精度が落ちる (システムプロンプトを持たない、
+# 指示文が 1 つに決まっている)。モデル名で判別し、公式の形式で問い合わせる。
+#
+#   - Tencent Hunyuan-MT-7B / HY-MT1.5 (1.8B, 7B): WMT25 で 31 中 30 の言語対で
+#     1 位。1.8B は GGUF で 1GB 前後になり、ゲーム中の GPU でも動かしやすい。
+#     出典: https://huggingface.co/tencent/HY-MT1.5-1.8B
+#           https://huggingface.co/tencent/Hunyuan-MT-7B
+#   - Google TranslateGemma (4B/12B/27B, 55 言語)。
+#     出典: https://ollama.com/library/translategemma
+
+PROFILE_DEFAULT = "default"
+PROFILE_HUNYUAN_MT = "hunyuan_mt"
+PROFILE_HY_MT15 = "hy_mt15"  # HY-MT1.5 は会話の文脈を渡す公式テンプレートがある
+PROFILE_TRANSLATEGEMMA = "translategemma"
+
+_HY_MT15_RE = re.compile(r"hy[-_]?mt[-_]?1\.5|hunyuan[-_]?mt[-_]?1\.5")
+_HUNYUAN_MT_RE = re.compile(r"hunyuan[-_]?mt|hy[-_]?mt")
+_TRANSLATEGEMMA_RE = re.compile(r"translate[-_]?gemma")
+
+# モデルカードの推奨値 (Hunyuan-MT-7B / HY-MT1.5 共通)
+_HUNYUAN_SAMPLING = {"temperature": 0.7, "top_p": 0.6, "top_k": 20, "repetition_penalty": 1.05}
+
+# Hunyuan の中国語テンプレートに入れる言語名
+_ZH_LANGUAGE_NAMES = {
+    "English": "英语", "Japanese": "日语", "Korean": "韩语",
+    "Chinese Simplified": "简体中文", "Chinese Traditional": "繁体中文", "Cantonese": "粤语",
+    "French": "法语", "German": "德语", "Spanish": "西班牙语", "Portuguese": "葡萄牙语",
+    "Italian": "意大利语", "Russian": "俄语", "Arabic": "阿拉伯语", "Thai": "泰语",
+    "Vietnamese": "越南语", "Indonesian": "印尼语", "Malay": "马来语", "Filipino": "菲律宾语",
+    "Tagalog": "菲律宾语", "Turkish": "土耳其语", "Hindi": "印地语", "Polish": "波兰语",
+    "Czech": "捷克语", "Dutch": "荷兰语", "Ukrainian": "乌克兰语", "Hebrew": "希伯来语",
+    "Persian": "波斯语", "Urdu": "乌尔都语", "Bengali": "孟加拉语", "Tamil": "泰米尔语",
+    "Kazakh": "哈萨克语", "Mongolian": "蒙古语", "Khmer": "高棉语", "Burmese": "缅甸语",
+}
+
+# TranslateGemma の言語名・コード。コードは Google の表から引き、
+# モデルの表記 (zh-Hans/zh-Hant) と表に無いものだけここで補う。
+_TRANSLATEGEMMA_OVERRIDES = {
+    "Chinese Simplified": ("Chinese", "zh-Hans"),
+    "Chinese Traditional": ("Chinese", "zh-Hant"),
+    "Norwegian": ("Norwegian", "no"),
+    "Persian": ("Persian", "fa"),
+    "Persian/Farsi": ("Persian", "fa"),
+    "Tagalog": ("Tagalog", "tl"),
+}
+
+
+def detectModelProfile(model_name: Optional[str]) -> str:
+    name = (model_name or "").lower()
+    if _TRANSLATEGEMMA_RE.search(name):
+        return PROFILE_TRANSLATEGEMMA
+    if _HY_MT15_RE.search(name):
+        return PROFILE_HY_MT15
+    if _HUNYUAN_MT_RE.search(name):
+        return PROFILE_HUNYUAN_MT
+    return PROFILE_DEFAULT
+
+
+def _isChinese(language: str) -> bool:
+    return language.startswith("Chinese") or language == "Cantonese"
+
+
+def _translateGemmaLanguage(language: str) -> tuple:
+    if language in _TRANSLATEGEMMA_OVERRIDES:
+        return _TRANSLATEGEMMA_OVERRIDES[language]
+    code = translation_lang.get("Google", {}).get("source", {}).get(language)
+    return language, code or language
+
+
+def buildHunyuanPrompt(text: str, input_lang: str, output_lang: str, context: str = "", contextual: bool = False) -> str:
+    """Hunyuan-MT / HY-MT1.5 の公式テンプレート。
+
+    中国語が絡む言語対は中国語の指示文、それ以外は英語の指示文を使う
+    (モデルカードの指定)。HY-MT1.5 は文脈付きテンプレート (中国語) を持つ。
+    """
+    if contextual and context:
+        target = _ZH_LANGUAGE_NAMES.get(output_lang, output_lang)
+        return f"{context}\n参考上面的信息，把下面的文本翻译成{target}，注意不需要翻译上文，也不要额外解释：\n{text}"
+    if _isChinese(input_lang) or _isChinese(output_lang):
+        target = _ZH_LANGUAGE_NAMES.get(output_lang, output_lang)
+        return f"将以下文本翻译为{target}，注意只需要输出翻译后的结果，不要额外解释：\n{text}"
+    return f"Translate the following segment into {output_lang}, without additional explanation.\n\n{text}"
+
+
+def buildTranslateGemmaPrompt(text: str, input_lang: str, output_lang: str) -> str:
+    """TranslateGemma の公式テンプレート (1 つの user メッセージ、本文の前に空行 2 つ)。"""
+    source_lang, source_code = _translateGemmaLanguage(input_lang)
+    target_lang, target_code = _translateGemmaLanguage(output_lang)
+    return (
+        f"You are a professional {source_lang} ({source_code}) to {target_lang} ({target_code}) translator. "
+        f"Your goal is to accurately convey the meaning and nuances of the original {source_lang} text "
+        f"while adhering to {target_lang} grammar, vocabulary, and cultural sensitivities.\n"
+        f"Produce only the {target_lang} translation, without any additional explanations or commentary. "
+        f"Please translate the following {source_lang} text into {target_lang}:\n"
+        f"\n"
+        f"\n"
+        f"{text}"
+    )
+
+
 def extractContent(resp: Any) -> str:
     """LangChain の応答 (AIMessage) からテキストを取り出す。
 
@@ -207,7 +309,20 @@ class LLMTranslationMixin:
         max_messages = int(self.history_cfg.get("max_messages") or 0)
         return header_tmpl.format(max_messages=max_messages, history=history_blob).strip()
 
+    def modelProfile(self) -> str:
+        return detectModelProfile(getattr(self, "model", None))
+
     def buildMessages(self, text: str, input_lang: str, output_lang: str) -> list[dict]:
+        profile = self.modelProfile()
+        if profile in (PROFILE_HUNYUAN_MT, PROFILE_HY_MT15):
+            # システムプロンプトを持たないモデル。指示と本文を 1 つの user メッセージで渡す
+            context = self._historyLines() if profile == PROFILE_HY_MT15 else ""
+            prompt = buildHunyuanPrompt(text, input_lang, output_lang, context=context, contextual=bool(context))
+            return [{"role": "user", "content": prompt}]
+        if profile == PROFILE_TRANSLATEGEMMA:
+            # 公式テンプレートに文脈の欄は無い。混ぜると形式から外れるので渡さない
+            return [{"role": "user", "content": buildTranslateGemmaPrompt(text, input_lang, output_lang)}]
+
         system_prompt = self.prompt_template.format(
             supported_languages=self.supported_languages,
             input_lang=input_lang,
@@ -223,7 +338,34 @@ class LLMTranslationMixin:
             {"role": "user", "content": text},
         ]
 
+    def _invokeKwargs(self, llm: Any) -> dict:
+        """モデルカードが推奨するサンプリング設定を、呼び出しごとに渡す。
+
+        汎用モデルには何も足さない (プロバイダ/モデル側の既定値が推奨値で、
+        gpt-5 系のように temperature の変更自体を拒否するモデルもある)。
+        """
+        if self.modelProfile() not in (PROFILE_HUNYUAN_MT, PROFILE_HY_MT15):
+            return {}
+        p = _HUNYUAN_SAMPLING
+        kind = type(llm).__name__
+        if kind == "ChatOllama":
+            return {"options": {
+                "temperature": p["temperature"],
+                "top_p": p["top_p"],
+                "top_k": p["top_k"],
+                "repeat_penalty": p["repetition_penalty"],
+            }}
+        if kind == "ChatOpenAI":
+            # LM Studio / llama.cpp server / vLLM / OpenRouter は top_k と
+            # repetition_penalty を OpenAI 互換 API の拡張パラメータとして受け付ける
+            return {
+                "temperature": p["temperature"],
+                "top_p": p["top_p"],
+                "extra_body": {"top_k": p["top_k"], "repetition_penalty": p["repetition_penalty"]},
+            }
+        return {}
+
     def _translateWith(self, llm: Any, text: str, input_lang: str, output_lang: str) -> str:
         messages = self.buildMessages(text, input_lang, output_lang)
-        resp = llm.invoke(messages)
+        resp = llm.invoke(messages, **self._invokeKwargs(llm))
         return cleanTranslationOutput(extractContent(resp), text)
