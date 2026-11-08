@@ -14,6 +14,8 @@ except Exception:
     from translation_llm_base import LLMTranslationMixin
     translation_lang = loadTranslationLanguages(path=".", force=True)
 
+_KEEP_ALIVE = "30m"
+
 def _authentication_check(base_url: str | None = None) -> bool:
     """Check authentication for Ollama API.
     """
@@ -70,6 +72,9 @@ class OllamaClient(LLMTranslationMixin, RecentModelList):
             base_url=self.base_url,
             model=self.model,
             streaming=False,
+            # Ollama の既定 (5 分) だと会話が少し途切れただけでモデルが
+            # アンロードされ、次の発言の翻訳でモデルの再ロード (数秒) を待つ
+            keep_alive=_KEEP_ALIVE,
         )
 
     def translate(self, text: str, input_lang: str, output_lang: str) -> str:
