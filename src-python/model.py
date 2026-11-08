@@ -1527,6 +1527,9 @@ class Model:
             )
             return [translation], [success_flag]
 
+        if translator_name == "CTranslate2":
+            return self._getInputTranslateCTranslate2(source_language, targets, message)
+
         # ターゲット言語ごとの翻訳を常設スレッドプールで並列化する。
         # 逐次ループだった頃は3言語有効時に実機で約3.9秒 (1言語あたり
         # 約1.3秒 × 3) かかっていた。翻訳はクラウドエンジンなら
@@ -1555,6 +1558,36 @@ class Model:
         results = [future.result() for future in futures]
 
         return [r[0] for r in results], [r[1] for r in results]
+
+    def _getInputTranslateCTranslate2(self, source_language, targets, message):
+        """CTranslate2 で複数ターゲット言語を 1 回のバッチで訳す。
+
+        CTranslate2 はモデル (tokenizer) を _ctranslate2_lock で守っているため、
+        スレッドプールで並列に投げても 1 言語ずつ順番にデコードされるだけで
+        速くならない。translate_batch に全ターゲットをまとめて渡せば、
+        デコードが 1 回で済む (3 言語でほぼ 1 言語分の時間)。
+
+        バッチで訳せなかったターゲット (未対応の言語ペア・失敗) だけ、従来の
+        getTranslate() に回して既存のフォールバック/リトライの挙動を保つ。
+        """
+        batch = self.translator.translateCTranslate2Targets(
+            weight_type=config.CTRANSLATE2_WEIGHT_TYPE,
+            source_language=source_language,
+            targets=targets,
+            message=message,
+        )
+        translations = []
+        flags = []
+        for (target_language, target_country), result in zip(targets, batch):
+            if isinstance(result, str):
+                translation, success_flag = result, True
+            else:
+                translation, success_flag = self.getTranslate(
+                    "CTranslate2", source_language, target_language, target_country, message
+                )
+            translations.append(translation)
+            flags.append(success_flag)
+        return translations, flags
 
     def getOutputTranslate(self, message, source_language=None):
         self.ensure_initialized()

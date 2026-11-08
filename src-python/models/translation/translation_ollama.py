@@ -1,18 +1,23 @@
+import threading
+
 import requests
 from langchain_ollama import ChatOllama
 
 try:
-    from .translation_languages import translation_lang
-    from .translation_utils import loadTranslatePromptConfig
     from .translation_model_list import RecentModelList
+    from .translation_llm_base import LLMTranslationMixin
 except Exception:
     import sys
     from os import path as os_path
     sys.path.append(os_path.dirname(os_path.abspath(__file__)))
-    from translation_languages import translation_lang, loadTranslationLanguages
-    from translation_utils import loadTranslatePromptConfig
+    from translation_languages import loadTranslationLanguages
     from translation_model_list import RecentModelList
-    translation_lang = loadTranslationLanguages(path=".", force=True)
+    from translation_llm_base import LLMTranslationMixin
+    loadTranslationLanguages(path=".", force=True)
+
+_KEEP_ALIVE = "30m"
+# 大きなモデルを HDD から読むと数十秒かかる
+_PRELOAD_TIMEOUT_SECONDS = 300
 
 def _authentication_check(base_url: str | None = None) -> bool:
     """Check authentication for Ollama API.
@@ -42,7 +47,7 @@ def _get_available_text_models(base_url: str | None = None) -> list[str]:
     allowed_models.sort()
     return allowed_models
 
-class OllamaClient(RecentModelList):
+class OllamaClient(LLMTranslationMixin, RecentModelList):
     """Ollama Translation simple wrapper.
     prompt/translation_ollama.yml から system_prompt / supported_languages を読み込む。
     """
@@ -50,19 +55,7 @@ class OllamaClient(RecentModelList):
         self.model = None
         self.base_url = "http://localhost:11434"
 
-        prompt_config = loadTranslatePromptConfig(root_path, "translation_ollama.yml")
-        self.supported_languages = list(translation_lang["Ollama"]["source"].keys())
-        self.prompt_template = prompt_config["system_prompt"]
-        # history config (optional)
-        self.history_cfg = prompt_config.get("history", {
-            "use_history": False,
-            "sources": [],
-            "max_messages": 0,
-            "max_chars": 0,
-            "header_template": "",
-            "item_template": "[{source}] {role}: {text}",
-        })
-        self._context_history: list[dict] = []
+        self._initPrompt(root_path, "translation_ollama.yml", "Ollama")
 
         self.openai_llm = None
 
@@ -82,76 +75,38 @@ class OllamaClient(RecentModelList):
             base_url=self.base_url,
             model=self.model,
             streaming=False,
+            # Ollama の既定 (5 分) だと会話が少し途切れただけでモデルが
+            # アンロードされ、次の発言の翻訳でモデルの再ロード (数秒) を待つ
+            keep_alive=_KEEP_ALIVE,
         )
+        self._preloadModel()
 
-    def setContextHistory(self, history_items: list[dict]) -> None:
-        """Set recent conversation history for prompt injection.
+    def _preloadModel(self) -> None:
+        """選んだモデルを Ollama に先に読み込ませる (バックグラウンド)。
 
-        Each item should be a dict containing:
-        - source: "chat" | "mic" | "speaker"
-        - text: message string
-        - timestamp: ISO format datetime string
+        Ollama は最初のリクエストが来てからモデルをロードするため、モデルを
+        選んだ直後の最初の発言の翻訳だけ数秒〜数十秒待たされていた。
+        prompt を付けない /api/generate はモデルのロードだけを行う
+        (Ollama の公式な事前ロードの方法)。失敗しても翻訳時にロードされるだけ。
         """
-        self._context_history = history_items or []
+        model, base_url = self.model, self.base_url
+        if not model:
+            return
+
+        def preload() -> None:
+            try:
+                requests.post(
+                    f"{base_url}/api/generate",
+                    json={"model": model, "keep_alive": _KEEP_ALIVE},
+                    timeout=_PRELOAD_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                pass
+
+        threading.Thread(target=preload, name="ollama-preload", daemon=True).start()
 
     def translate(self, text: str, input_lang: str, output_lang: str) -> str:
-        system_prompt = self.prompt_template.format(
-            supported_languages=self.supported_languages,
-            input_lang=input_lang,
-            output_lang=output_lang,
-        )
-
-        # Inject recent conversation history if enabled by YAML config
-        if self.history_cfg.get("use_history"):
-            allowed_sources = set(self.history_cfg.get("sources", []))
-            max_messages = int(self.history_cfg.get("max_messages", 0))
-            max_chars = int(self.history_cfg.get("max_chars", 0))
-            item_tmpl = self.history_cfg.get("item_template", "[{source}] {role}: {text}")
-            header_tmpl = self.history_cfg.get("header_template", "{history}")
-
-            filtered = [h for h in self._context_history if h.get("source") in allowed_sources]
-            recent = filtered[-max_messages:] if max_messages > 0 else filtered
-            formatted_items = []
-            for h in recent:
-                # Format timestamp as HH:MM to save tokens
-                timestamp_str = ''
-                if 'timestamp' in h:
-                    from datetime import datetime
-                    try:
-                        ts = datetime.fromisoformat(h['timestamp'])
-                        timestamp_str = ts.strftime('%H:%M')
-                    except:
-                        timestamp_str = ''
-                formatted_items.append(
-                    item_tmpl.format(
-                        timestamp=timestamp_str,
-                        source=h.get("source", ""),
-                        text=h.get("text", ""),
-                    )
-                )
-            history_blob = "\n".join(formatted_items).strip()
-            if max_chars and len(history_blob) > max_chars:
-                history_blob = history_blob[-max_chars:]
-            history_header = header_tmpl.format(max_messages=max_messages, history=history_blob)
-            if history_header:
-                system_prompt = f"{system_prompt}\n\n{history_header}"
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": text},
-        ]
-
-        resp = self.openai_llm.invoke(messages)
-        content = ""
-        if isinstance(resp.content, str):
-            content = resp.content
-        elif isinstance(resp.content, list):
-            for part in resp.content:
-                if isinstance(part, str):
-                    content += part
-                elif isinstance(part, dict) and "content" in part and isinstance(part["content"], str):
-                    content += part["content"]
-        return content.strip()
+        return self._translateWith(self.openai_llm, text, input_lang, output_lang)
 
 if __name__ == "__main__":
     client = OllamaClient()
