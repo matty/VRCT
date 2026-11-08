@@ -19,6 +19,7 @@ from models.translation.translation_llm_base import (
     cleanTranslationOutput,
     detectModelProfile,
     extractContent,
+    maxOutputTokens,
 )
 from models.translation.translation_ollama import OllamaClient
 from models.translation.translation_lmstudio import LMStudioClient
@@ -175,6 +176,7 @@ class HunyuanPromptTests(unittest.TestCase):
         self.client._translateWith(llm, "Hello", "English", "Japanese")
         self.assertEqual(llm.calls[0][1], {"options": {
             "temperature": 0.7, "top_p": 0.6, "top_k": 20, "repeat_penalty": 1.05,
+            "num_predict": 64,  # 出力上限 = max(64, 文字数 × 4)
         }})
 
     def test_recommended_sampling_for_openai_compatible_servers(self):
@@ -185,8 +187,16 @@ class HunyuanPromptTests(unittest.TestCase):
         self.assertEqual(llm.calls[0][1], {
             "temperature": 0.7,
             "top_p": 0.6,
+            "max_tokens": 64,
             "extra_body": {"top_k": 20, "repetition_penalty": 1.05},
         })
+
+
+class MaxOutputTokensTests(unittest.TestCase):
+    def test_scales_with_input_and_has_a_floor(self):
+        self.assertEqual(maxOutputTokens(""), 64)
+        self.assertEqual(maxOutputTokens("x" * 10), 64)
+        self.assertEqual(maxOutputTokens("x" * 100), 400)
 
 
 class TranslateGemmaPromptTests(unittest.TestCase):

@@ -114,6 +114,16 @@ _TRANSLATEGEMMA_OVERRIDES = {
 }
 
 
+# 翻訳専用モデルの出力トークン数の上限 = 入力の文字数 × 4 (最低 64)。
+# 1 文字あたりのトークン数は日本語・中国語でも概ね 1〜2 なので十分な余裕がある。
+_MAX_OUTPUT_TOKENS_PER_CHAR = 4
+_MIN_OUTPUT_TOKENS = 64
+
+
+def maxOutputTokens(text: str) -> int:
+    return max(_MIN_OUTPUT_TOKENS, len(text or "") * _MAX_OUTPUT_TOKENS_PER_CHAR)
+
+
 def detectModelProfile(model_name: Optional[str]) -> str:
     name = (model_name or "").lower()
     if _TRANSLATEGEMMA_RE.search(name):
@@ -338,15 +348,20 @@ class LLMTranslationMixin:
             {"role": "user", "content": text},
         ]
 
-    def _invokeKwargs(self, llm: Any) -> dict:
+    def _invokeKwargs(self, llm: Any, text: str = "") -> dict:
         """モデルカードが推奨するサンプリング設定を、呼び出しごとに渡す。
 
         汎用モデルには何も足さない (プロバイダ/モデル側の既定値が推奨値で、
         gpt-5 系のように temperature の変更自体を拒否するモデルもある)。
+
+        翻訳専用モデルには出力トークン数の上限も付ける。翻訳は入力の長さで
+        出力の長さがほぼ決まるので、まれな繰り返しの暴走を短く打ち切れる
+        (汎用モデルは推論トークンも上限に数えるものがあるため付けない)。
         """
         if self.modelProfile() not in (PROFILE_HUNYUAN_MT, PROFILE_HY_MT15):
             return {}
         p = _HUNYUAN_SAMPLING
+        max_tokens = maxOutputTokens(text)
         kind = type(llm).__name__
         if kind == "ChatOllama":
             return {"options": {
@@ -354,6 +369,7 @@ class LLMTranslationMixin:
                 "top_p": p["top_p"],
                 "top_k": p["top_k"],
                 "repeat_penalty": p["repetition_penalty"],
+                "num_predict": max_tokens,
             }}
         if kind == "ChatOpenAI":
             # LM Studio / llama.cpp server / vLLM / OpenRouter は top_k と
@@ -361,11 +377,12 @@ class LLMTranslationMixin:
             return {
                 "temperature": p["temperature"],
                 "top_p": p["top_p"],
+                "max_tokens": max_tokens,
                 "extra_body": {"top_k": p["top_k"], "repetition_penalty": p["repetition_penalty"]},
             }
         return {}
 
     def _translateWith(self, llm: Any, text: str, input_lang: str, output_lang: str) -> str:
         messages = self.buildMessages(text, input_lang, output_lang)
-        resp = llm.invoke(messages, **self._invokeKwargs(llm))
+        resp = llm.invoke(messages, **self._invokeKwargs(llm, text))
         return cleanTranslationOutput(extractContent(resp), text)
