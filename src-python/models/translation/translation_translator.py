@@ -37,7 +37,7 @@ except Exception:
 _WEB_TRANSLATOR_TIMEOUT_SECONDS = 10
 
 import warnings
-from threading import Lock, RLock
+from threading import Lock, RLock, Thread
 from typing import Any, Dict, Hashable, List, Optional, Tuple
 
 warnings.filterwarnings("ignore")
@@ -66,6 +66,12 @@ _CT2_DECODING_LENGTH_MAX = 256
 # 訳す。「はじめまして！」のような短い挨拶を単独で訳すと文脈が無く誤訳しやすい
 # (実測: NLLB-600M が "You're welcome!" と訳した。まとめれば "Hello!")。
 _CT2_MIN_SEGMENT_TOKENS = 8
+
+# ロード直後のウォームアップに使う言語 (重みの種類の接頭辞 → (原文, 訳文))
+_CT2_WARMUP_LANGS = {
+    "m2m100": ("en", "ja"),
+    "nllb": ("eng_Latn", "jpn_Jpan"),
+}
 
 # --- CTranslate2 用の文分割 -------------------------------------------------
 # NLLB/M2M100 は 1 文単位で学習されており、複数文をまとめて渡すと後半の文を
@@ -628,6 +634,25 @@ class Translator:
             # 重みが変われば訳も変わる (キーに weight_type は含むが、同じ重みの
             # 再ロードでも念のため捨てる)
             self._cache.clear()
+            self._startCTranslate2Warmup(model_type)
+
+    def _startCTranslate2Warmup(self, model_type: str) -> None:
+        """ロード直後に 1 回だけ短い文を訳しておく (バックグラウンド)。
+
+        CTranslate2 は最初の translate_batch でメモリ確保や重みのページインを
+        行うため、ロード直後の 1 件目だけ遅い (NLLB-600M int8 / CPU の実測で
+        約 680ms、2 件目以降は約 360ms)。ユーザーの最初の発言でこれを
+        払わないよう先に済ませる。ロード処理 (翻訳 ON の操作) は待たせない
+        ためスレッドで行い、ロックを取るので実際の翻訳とは重ならない。
+        """
+        source, target = _CT2_WARMUP_LANGS.get(model_type.split("_")[0].split("-")[0], (None, None))
+        if source is None:
+            return
+
+        def warmup() -> None:
+            self.translateCTranslate2Batch("Hello.", source, [target], model_type)
+
+        Thread(target=warmup, name="ct2-warmup", daemon=True).start()
 
     def isLoadedCTranslate2Model(self) -> bool:
         return self.is_loaded_ctranslate2_model
