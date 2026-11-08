@@ -49,6 +49,10 @@ warnings.filterwarnings("ignore")
 _CACHEABLE_ENGINES = frozenset({"Google", "Bing", "Papago", "CTranslate2"})
 _TRANSLATION_CACHE_MAX_ITEMS = 512
 
+# DeepL の context に渡す直近の会話の上限。context は課金対象外。
+_DEEPL_CONTEXT_MAX_MESSAGES = 5
+_DEEPL_CONTEXT_MAX_CHARS = 1000
+
 # CTranslate2 の出力トークン数の上限 = 入力トークン数 × 係数 + 余白。
 # NLLB/M2M100 は短い入力で同じ句を繰り返し続ける幻覚を起こすことがあり、
 # 既定 (256 トークン) まで生成し続けると数秒かかったうえに誤訳になる。
@@ -760,6 +764,18 @@ class Translator:
         return results
 
     @staticmethod
+    def _deeplContext(context_history: Optional[list[dict]]) -> Optional[str]:
+        """DeepL の `context` に渡す直近の会話。訳の曖昧さ (代名詞・省略された
+        主語・口調) の解消に使われ、訳文には含まれない。課金対象外。"""
+        if not context_history:
+            return None
+        texts = [h.get("text", "").strip() for h in context_history[-_DEEPL_CONTEXT_MAX_MESSAGES:]]
+        context = "\n".join(t for t in texts if t)
+        if len(context) > _DEEPL_CONTEXT_MAX_CHARS:
+            context = context[-_DEEPL_CONTEXT_MAX_CHARS:]
+        return context or None
+
+    @staticmethod
     def getLanguageCode(translator_name: str, weight_type: str, target_country: str, source_language: str, target_language: str) -> Tuple[str, str]:
         """Resolve a friendly language name to translator-specific codes.
 
@@ -839,10 +855,15 @@ class Translator:
                         if self.deepl_client is None:
                             result = False
                         else:
+                            deepl_kwargs = {}
+                            context = self._deeplContext(context_history)
+                            if context:
+                                deepl_kwargs["context"] = context
                             result = self.deepl_client.translate_text(
                                 message,
                                 source_lang=source_language,
-                                target_lang=target_language
+                                target_lang=target_language,
+                                **deepl_kwargs,
                                 ).text
                 case name if name in TRANSLATION_PROVIDER_REGISTRY:
                     # Plamo_API/Gemini_API/OpenAI_API/Groq_API/OpenRouter_API

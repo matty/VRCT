@@ -1,4 +1,4 @@
-"""CTranslate2 の文分割・一括翻訳と、翻訳キャッシュのテスト。
+"""CTranslate2 の文分割・一括翻訳と、翻訳キャッシュ/DeepL 文脈のテスト。
 
 - NLLB/M2M100 は文単位のモデルなので、複数文は文ごとに訳してつなぐ
 - 複数ターゲット言語は translate_batch 1 回にまとめる (ロックで直列化される
@@ -190,6 +190,25 @@ class TranslateCacheAndContextTests(unittest.TestCase):
         for _ in range(2):
             translator.translate("Gemini_API", NLLB, "Japanese", "English", "Japan", "こんにちは")
         self.assertEqual(client.translate.call_count, 2)
+
+    def test_deepl_receives_recent_conversation_as_context(self):
+        translator = Translator()
+        translator.is_enable_translators = True
+        translator.deepl_client = MagicMock()
+        translator.deepl_client.translate_text.return_value = MagicMock(text="Hello")
+        history = [{"source": "speaker", "text": f"line {i}"} for i in range(8)]
+        translator.translate("DeepL_API", NLLB, "Japanese", "English", "Japan", "こんにちは", context_history=history)
+        _, kwargs = translator.deepl_client.translate_text.call_args
+        self.assertEqual(kwargs["context"], "line 3\nline 4\nline 5\nline 6\nline 7")
+
+    def test_deepl_without_history_sends_no_context(self):
+        translator = Translator()
+        translator.is_enable_translators = True
+        translator.deepl_client = MagicMock()
+        translator.deepl_client.translate_text.return_value = MagicMock(text="Hello")
+        translator.translate("DeepL_API", NLLB, "Japanese", "English", "Japan", "こんにちは")
+        _, kwargs = translator.deepl_client.translate_text.call_args
+        self.assertNotIn("context", kwargs)
 
 
 if __name__ == "__main__":
