@@ -2,14 +2,12 @@ from openai import OpenAI
 
 try:
     from .translation_languages import translation_lang
-    from .translation_utils import loadTranslatePromptConfig
     from .translation_openai import OpenAIClient, _fetch_models
 except Exception:
     import sys
     from os import path as os_path
     sys.path.append(os_path.dirname(os_path.dirname(os_path.dirname(os_path.abspath(__file__)))))
     from translation_languages import translation_lang, loadTranslationLanguages
-    from translation_utils import loadTranslatePromptConfig
     from translation_openai import OpenAIClient, _fetch_models
     translation_lang = loadTranslationLanguages(path=".", force=True)
 
@@ -69,18 +67,7 @@ class OpenAICompatibleClient(OpenAIClient):
         self.model = None
         self.base_url = base_url if base_url else self.DEFAULT_BASE_URL
 
-        prompt_config = loadTranslatePromptConfig(root_path, "translation_openai_compatible.yml")
-        self.supported_languages = list(translation_lang["OpenAI_Compatible"]["source"].keys())
-        self.prompt_template = prompt_config["system_prompt"]
-        self.history_cfg = prompt_config.get("history", {
-            "use_history": False,
-            "sources": [],
-            "max_messages": 0,
-            "max_chars": 0,
-            "header_template": "",
-            "item_template": "[{source}] {role}: {text}",
-        })
-        self._context_history: list[dict] = []
+        self._initPrompt(root_path, "translation_openai_compatible.yml", "OpenAI_Compatible")
         self.openai_llm = None
 
     def getBaseURL(self) -> str:
