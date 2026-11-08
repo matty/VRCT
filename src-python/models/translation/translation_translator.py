@@ -1,3 +1,5 @@
+import re
+from collections import OrderedDict
 from os import path as os_path
 from deepl import DeepLClient
 
@@ -35,10 +37,149 @@ except Exception:
 _WEB_TRANSLATOR_TIMEOUT_SECONDS = 10
 
 import warnings
-from threading import RLock
-from typing import Any, Dict, Optional, Tuple
+from threading import Lock, RLock
+from typing import Any, Dict, Hashable, List, Optional, Tuple
 
 warnings.filterwarnings("ignore")
+
+# 結果をキャッシュするエンジン。入力 (言語ペア + 原文) だけで出力が決まるものに
+# 限る。LLM 系と DeepL は会話履歴 (context) で訳が変わるため対象外。
+# VRChat の会話は「こんにちは」「ありがとう」「www」のような短い定型句が
+# 繰り返し出るので、ヒットすればネットワーク往復/デコードを丸ごと省ける。
+_CACHEABLE_ENGINES = frozenset({"Google", "Bing", "Papago", "CTranslate2"})
+_TRANSLATION_CACHE_MAX_ITEMS = 512
+
+# CTranslate2 の出力トークン数の上限 = 入力トークン数 × 係数 + 余白。
+# NLLB/M2M100 は短い入力で同じ句を繰り返し続ける幻覚を起こすことがあり、
+# 既定 (256 トークン) まで生成し続けると数秒かかったうえに誤訳になる。
+# 正常な訳がこの上限に届くことはまずない (日英間でも概ね 2 倍以内)。
+_CT2_DECODING_LENGTH_RATIO = 3
+_CT2_DECODING_LENGTH_MARGIN = 16
+_CT2_DECODING_LENGTH_MAX = 256
+
+# これより短い文 (トークン数、言語タグと </s> の 2 つを含む。"Hi!" = 4、
+# "はじめまして！" = 6、"See you tomorrow, okay?" = 8) は前後の文とまとめて
+# 訳す。「はじめまして！」のような短い挨拶を単独で訳すと文脈が無く誤訳しやすい
+# (実測: NLLB-600M が "You're welcome!" と訳した。まとめれば "Hello!")。
+_CT2_MIN_SEGMENT_TOKENS = 8
+
+# --- CTranslate2 用の文分割 -------------------------------------------------
+# NLLB/M2M100 は 1 文単位で学習されており、複数文をまとめて渡すと後半の文を
+# 落としたり混ぜたりしやすい。文に分けて 1 回のバッチで訳し、つなぎ直す。
+_ABBREVIATIONS = frozenset({
+    "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc", "e.g", "i.e",
+    "approx", "vol", "fig", "jan", "feb", "mar", "apr", "jun", "jul",
+    "aug", "sep", "sept", "oct", "nov", "dec",
+})
+# 文末記号 (と閉じ括弧・引用符) の直後。全角の文末記号は空白なしでも区切る。
+_SENTENCE_END_RE = re.compile(
+    r"(?:[.!?…]+[\"'’”)\]]*(?=\s)|[。！？．]+[」』）)\"'”]*)"
+)
+# 全角の句読点・閉じ括弧で終わる訳文の後ろには空白を入れずにつなぐ (日本語・
+# 中国語の文は空白で区切らない)。NLLB は日本語の訳文に「。」を付けないことが
+# 多く、その場合に空白なしでつなぐと文の境目が消えるので、句読点のときだけ。
+_NO_SPACE_JOIN_RE = re.compile(
+    "[、。」』】〕〗〙〛〞〟"
+    "！），．：；？］｝｠]$"
+)
+
+
+def splitSentences(text: str) -> List[str]:
+    """CTranslate2 に渡すために文へ分ける。分けられなければ [text]。"""
+    segments: List[str] = []
+    for line in text.splitlines():
+        start = 0
+        for m in _SENTENCE_END_RE.finditer(line):
+            end = m.end()
+            piece = line[start:end]
+            following = line[end:].lstrip()[:1]
+            if following.isascii() and following.islower():
+                # '"Really?" she said.' のように小文字で続くなら文の途中
+                continue
+            if line[m.start()] == ".":
+                # "Mr. Smith" "U.S. troops" "J. Smith" のような略語・頭文字では区切らない
+                # ("3.5" は "." の直後が空白でないので、そもそも一致しない)
+                word = re.findall(r"([A-Za-z.]+)\.$", piece.rstrip("\"')]’”"))
+                if word and (word[0].lower() in _ABBREVIATIONS or len(word[0]) == 1 or "." in word[0]):
+                    continue
+            _appendSegment(segments, piece)
+            start = end
+        _appendSegment(segments, line[start:])
+    return segments or [text]
+
+
+def _appendSegment(segments: List[str], piece: str) -> None:
+    piece = piece.strip()
+    if not piece:
+        return
+    # 文字を含まない断片 (絵文字・記号だけ) を単独で訳させると、モデルが
+    # 存在しない文を作ることがある。直前の文にくっつける。
+    if segments and not re.search(r"\w", piece):
+        segments[-1] = f"{segments[-1]} {piece}"
+    else:
+        segments.append(piece)
+
+
+def joinSentences(sentences: List[str]) -> str:
+    result = ""
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        if result and not _NO_SPACE_JOIN_RE.search(result):
+            result += " "
+        result += sentence
+    return result
+
+
+
+def mergeShortSentences(sentences: List[str], token_counts: List[int], min_tokens: int = _CT2_MIN_SEGMENT_TOKENS) -> List[str]:
+    """短い文を後ろの文と (最後なら前の文と) まとめる。"""
+    chunks: List[List[str]] = []
+    current: List[str] = []
+    current_tokens = 0
+    for sentence, count in zip(sentences, token_counts):
+        current.append(sentence)
+        current_tokens += count
+        if current_tokens >= min_tokens:
+            chunks.append(current)
+            current, current_tokens = [], 0
+    if current:
+        if chunks:
+            chunks[-1].extend(current)
+        else:
+            chunks.append(current)
+    return [joinSentences(chunk) for chunk in chunks]
+
+class _TranslationCache:
+    """スレッドセーフな LRU。getInputTranslate はターゲット言語ごとに並列で呼ぶ。"""
+
+    def __init__(self, max_items: int = _TRANSLATION_CACHE_MAX_ITEMS) -> None:
+        self._max_items = max_items
+        self._items: "OrderedDict[Hashable, str]" = OrderedDict()
+        self._lock = Lock()
+
+    def get(self, key: Hashable) -> Optional[str]:
+        with self._lock:
+            value = self._items.get(key)
+            if value is not None:
+                self._items.move_to_end(key)
+            return value
+
+    def put(self, key: Hashable, value: str) -> None:
+        with self._lock:
+            self._items[key] = value
+            self._items.move_to_end(key)
+            while len(self._items) > self._max_items:
+                self._items.popitem(last=False)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._items.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._items)
 
 
 class UnsupportedLanguageError(Exception):
@@ -147,6 +288,7 @@ class Translator:
         # 呼び出し元が既にロックを保持した状態で再入する可能性に備えるため
         # (現状のコードパスでは再入は起きない)。
         self._ctranslate2_lock: RLock = RLock()
+        self._cache = _TranslationCache()
 
     def authenticationDeepLAuthKey(self, auth_key: str) -> bool:
         """Authenticate DeepL API with the provided key.
@@ -479,6 +621,9 @@ class Translator:
                 tokenizer_path = os_path.join("./weights", "ctranslate2", directory_name, "tokenizer")
                 self.ctranslate2_tokenizer = transformers.AutoTokenizer.from_pretrained(tokenizer, cache_dir=tokenizer_path)
             self.is_loaded_ctranslate2_model = True
+            # 重みが変われば訳も変わる (キーに weight_type は含むが、同じ重みの
+            # 再ロードでも念のため捨てる)
+            self._cache.clear()
 
     def isLoadedCTranslate2Model(self) -> bool:
         return self.is_loaded_ctranslate2_model
@@ -489,30 +634,130 @@ class Translator:
     def setChangedTranslatorParameters(self, is_changed: bool) -> None:
         self.is_changed_translator_parameters = is_changed
 
+    def _ctranslate2TargetToken(self, target_language: str, weight_type: str) -> Optional[str]:
+        match weight_type:
+            case "m2m100_418M-ct2-int8" | "m2m100_1.2B-ct2-int8":
+                return self.ctranslate2_tokenizer.lang_code_to_token[target_language]
+            case "nllb-200-distilled-600M-ct2-int8" | "nllb-200-distilled-1.3B-ct2-int8" | "nllb-200-3.3B-ct2-int8":
+                return target_language
+            case _:
+                return None
+
+    def translateCTranslate2Batch(self, message: str, source_language: str, target_languages: List[str], weight_type: str) -> List[Any]:
+        """Translate `message` into every language code in `target_languages`
+        with a single ``translate_batch`` call.
+
+        The message is split into sentences (NLLB/M2M100 are sentence-level
+        models and drop or garble content when given several sentences at
+        once), and every (sentence, target) pair goes into one batch. With
+        several target languages this replaces N sequential decodes - the
+        lock serialises them anyway - with one batched decode.
+
+        Returns one entry per target: a string on success, False on failure.
+        """
+        results: List[Any] = [False] * len(target_languages)
+        if not target_languages:
+            return results
+        with self._ctranslate2_lock:
+            if self.is_loaded_ctranslate2_model is not True:
+                return results
+            try:
+                prefixes = [self._ctranslate2TargetToken(t, weight_type) for t in target_languages]
+                if any(p is None for p in prefixes):
+                    return results
+                tokenizer = self.ctranslate2_tokenizer
+                tokenizer.src_lang = source_language
+                sentences = splitSentences(message)
+                sources = [tokenizer.convert_ids_to_tokens(tokenizer.encode(s)) for s in sentences]
+                if len(sentences) > 1:
+                    merged = mergeShortSentences(sentences, [len(s) for s in sources])
+                    if len(merged) != len(sentences):
+                        sentences = merged
+                        sources = [tokenizer.convert_ids_to_tokens(tokenizer.encode(s)) for s in sentences]
+
+                batch_sources = []
+                batch_prefixes = []
+                for prefix in prefixes:
+                    for source in sources:
+                        batch_sources.append(source)
+                        batch_prefixes.append([prefix])
+                max_decoding_length = min(
+                    _CT2_DECODING_LENGTH_MAX,
+                    max(len(s) for s in sources) * _CT2_DECODING_LENGTH_RATIO + _CT2_DECODING_LENGTH_MARGIN,
+                )
+                outputs = self.ctranslate2_translator.translate_batch(
+                    batch_sources,
+                    target_prefix=batch_prefixes,
+                    max_decoding_length=max_decoding_length,
+                )
+
+                n = len(sources)
+                for i in range(len(prefixes)):
+                    decoded = []
+                    for j in range(n):
+                        target = outputs[i * n + j].hypotheses[0][1:]
+                        decoded.append(tokenizer.decode(tokenizer.convert_tokens_to_ids(target)))
+                    results[i] = decoded[0] if n == 1 else joinSentences(decoded)
+            except Exception:
+                errorLogging()
+                results = [False] * len(target_languages)
+        return results
+
     def translateCTranslate2(self, message: str, source_language: str, target_language, weight_type: str) -> Any:
         """Translate using a loaded CTranslate2 model.
 
         Returns a string on success or False on failure (keeps legacy behavior).
         """
-        result: Any = False
-        with self._ctranslate2_lock:
-            if self.is_loaded_ctranslate2_model is True:
-                try:
-                    self.ctranslate2_tokenizer.src_lang = source_language
-                    source = self.ctranslate2_tokenizer.convert_ids_to_tokens(self.ctranslate2_tokenizer.encode(message))
-                    match weight_type:
-                        case "m2m100_418M-ct2-int8" | "m2m100_1.2B-ct2-int8":
-                            target_prefix = [self.ctranslate2_tokenizer.lang_code_to_token[target_language]]
-                        case "nllb-200-distilled-600M-ct2-int8" | "nllb-200-distilled-1.3B-ct2-int8" | "nllb-200-3.3B-ct2-int8":
-                            target_prefix = [target_language]
-                        case _:
-                            return False
-                    results = self.ctranslate2_translator.translate_batch([source], target_prefix=[target_prefix])
-                    target = results[0].hypotheses[0][1:]
-                    result = self.ctranslate2_tokenizer.decode(self.ctranslate2_tokenizer.convert_tokens_to_ids(target))
-                except Exception:
-                    errorLogging()
-        return result
+        return self.translateCTranslate2Batch(message, source_language, [target_language], weight_type)[0]
+
+    @staticmethod
+    def _cacheKey(translator_name: str, weight_type: str, source_language: str, target_language: str, message: str) -> Tuple:
+        # target_country は DeepL の英語/ポルトガル語の変種選択にしか使われず、
+        # DeepL はキャッシュ対象外なのでキーに含めない (国違いでも同じ訳を共有する)。
+        return (
+            translator_name,
+            weight_type if translator_name == "CTranslate2" else "",
+            source_language,
+            target_language,
+            message,
+        )
+
+    def translateCTranslate2Targets(self, weight_type: str, source_language: str, targets: List[Tuple[str, str]], message: str) -> List[Any]:
+        """Translate `message` with CTranslate2 into several target languages at once.
+
+        `targets` is a list of (language name, country). Each entry of the
+        result follows the `translate()` contract: str on success, None if the
+        language pair is unsupported, False on failure.
+        """
+        results: List[Any] = [None] * len(targets)
+        pending = []  # (index, cache key, target code)
+        source_code = None
+        for i, (target_language, target_country) in enumerate(targets):
+            if source_language == target_language:
+                results[i] = message
+                continue
+            try:
+                src_code, tgt_code = self.getLanguageCode("CTranslate2", weight_type, target_country, source_language, target_language)
+            except UnsupportedLanguageError:
+                results[i] = None
+                continue
+            key = self._cacheKey("CTranslate2", weight_type, source_language, target_language, message)
+            cached = self._cache.get(key)
+            if cached is not None:
+                results[i] = cached
+                continue
+            source_code = src_code
+            pending.append((i, key, tgt_code))
+
+        if pending:
+            translated = self.translateCTranslate2Batch(message, source_code, [p[2] for p in pending], weight_type)
+            for (i, key, _), result in zip(pending, translated):
+                if isinstance(result, str) and (result.strip() or not message.strip()):
+                    self._cache.put(key, result)
+                    results[i] = result
+                else:
+                    results[i] = False
+        return results
 
     @staticmethod
     def getLanguageCode(translator_name: str, weight_type: str, target_country: str, source_language: str, target_language: str) -> Tuple[str, str]:
@@ -581,6 +826,12 @@ class Translator:
             # translation as a success, skipping the CTranslate2 fallback and
             # the error log. False routes it through the fallback instead.
             result: Any = False
+            cache_key = None
+            if translator_name in _CACHEABLE_ENGINES:
+                cache_key = self._cacheKey(translator_name, weight_type, source_language, target_language, message)
+                cached = self._cache.get(cache_key)
+                if cached is not None:
+                    return cached
             source_language, target_language = self.getLanguageCode(translator_name, weight_type, target_country, source_language, target_language)
             match translator_name:
                 case "DeepL_API":
@@ -678,6 +929,14 @@ class Translator:
                         target_language=target_language,
                         weight_type=weight_type,
                         )
+            if isinstance(result, str):
+                if not result.strip() and message.strip():
+                    # 空の訳は成功ではない。呼び出し元は isinstance(str) で成功を
+                    # 判定するので、"" を返すと CTranslate2 へのフォールバックが
+                    # 飛ばされ、空のメッセージが送られてしまう。
+                    result = False
+                elif cache_key is not None:
+                    self._cache.put(cache_key, result)
         except UnsupportedLanguageError:
             result = None
         except Exception:

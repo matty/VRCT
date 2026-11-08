@@ -61,11 +61,19 @@ class _InputTranslateTestBase(unittest.TestCase):
 
         self._saved_targets = config.SELECTED_TARGET_LANGUAGES
         self._saved_tab = config.SELECTED_TAB_NO
+        self._saved_engines = config.SELECTED_TRANSLATION_ENGINES
+        # スレッドプールで並列化するのはネットワーク系エンジン。既定の
+        # CTranslate2 は 1 回のバッチ翻訳にまとめる別経路
+        # (test_model_input_translate_ctranslate2_batch.py) を通る。
+        engines = dict(config.SELECTED_TRANSLATION_ENGINES)
+        engines[config.SELECTED_TAB_NO] = "Google"
+        config.SELECTED_TRANSLATION_ENGINES = engines
 
     def tearDown(self) -> None:
         self.executor.shutdown(wait=False)
         config.SELECTED_TARGET_LANGUAGES = self._saved_targets
         config.SELECTED_TAB_NO = self._saved_tab
+        config.SELECTED_TRANSLATION_ENGINES = self._saved_engines
 
     def _enableTargets(self, *languages: str) -> None:
         targets = config.SELECTED_TARGET_LANGUAGES

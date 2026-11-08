@@ -64,7 +64,7 @@ class _FakeResult:
 
 
 class _FakeCTranslate2Translator:
-    def translate_batch(self, sources, target_prefix):
+    def translate_batch(self, sources, target_prefix, **kwargs):
         return [_FakeResult([["<s>", "tok"]])]
 
 
