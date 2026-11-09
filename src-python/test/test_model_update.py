@@ -299,8 +299,8 @@ class TestPinnedVersionDownload(unittest.TestCase):
     beta.2 から beta.1 を選んだとき)。
     """
 
-    BETA_MAIN = "https://huggingface.co/ms-software/VRCT-beta/resolve/main/VRCT_setup.exe"
-    STABLE_MAIN = "https://huggingface.co/ms-software/VRCT/resolve/main/VRCT_setup.exe"
+    # 最新の stable リリースの setup.exe (指定版とは別物)
+    STABLE_LATEST = "https://github.com/matty/VRCT/releases/latest/download/VRCT_setup.exe"
 
     def setUp(self) -> None:
         self.payload = b"data" * 300_000
@@ -333,20 +333,18 @@ class TestPinnedVersionDownload(unittest.TestCase):
             return responses[url]
         return fake_get
 
-    def test_setup_download_url_follows_the_target_version(self) -> None:
+    def test_setup_download_url_points_at_the_tags_release_asset(self) -> None:
         self.assertEqual(
-            config.setupDownloadUrl("3.5.1-beta.1", tag="v3.5.1-beta.1"),
-            "https://huggingface.co/ms-software/VRCT-beta/resolve/v3.5.1-beta.1/VRCT_setup.exe",
+            config.setupDownloadUrl("v3.5.1-beta.1"),
+            "https://github.com/matty/VRCT/releases/download/v3.5.1-beta.1/VRCT_setup.exe",
         )
         self.assertEqual(
-            config.setupDownloadUrl("3.5.0", tag="v3.5.0"),
-            "https://huggingface.co/ms-software/VRCT/resolve/v3.5.0/VRCT_setup.exe",
+            config.setupDownloadUrl("v3.5.0"),
+            "https://github.com/matty/VRCT/releases/download/v3.5.0/VRCT_setup.exe",
         )
 
-    def test_setup_download_url_without_tag_is_main_of_the_versions_channel(self) -> None:
-        self.assertEqual(config.setupDownloadUrl(), self.STABLE_MAIN)
-        self.assertEqual(config.setupDownloadUrl("3.5.1-beta.1"), self.BETA_MAIN)
-        self.assertEqual(config.setupDownloadUrl("3.5.1-rc.1"), self.BETA_MAIN)
+    def test_setup_download_url_without_tag_is_the_latest_stable_release(self) -> None:
+        self.assertEqual(config.setupDownloadUrl(), self.STABLE_LATEST)
 
     @patch("model.os_exit")
     @patch("model.psutil_Process")
@@ -358,15 +356,14 @@ class TestPinnedVersionDownload(unittest.TestCase):
         target = "3.6.0-beta.1"
         # tag_name は GitHub が返したものをそのまま使う ("v"+version と決め打ちしない)
         tag = "v3.6.0-beta.1-custom"
-        tag_url = config.setupDownloadUrl(target, tag=tag)
+        tag_url = config.setupDownloadUrl(tag)
         requested: list = []
         requests_get.side_effect = self._fake_get(
             [self._release("3.6.0-beta.2", "v3.6.0-beta.2", False), self._release(target, tag, True)],
             {
                 f"https://example.invalid/{target}.sha256": _make_text_response(self.sha256),
                 tag_url: _make_download_response(self.payload),
-                # main (= 最新版) の setup.exe は指定版とは別物
-                self.BETA_MAIN: _make_download_response(b"other" * 300_000),
+                self.STABLE_LATEST: _make_download_response(b"other" * 300_000),
             },
             requested,
         )
@@ -374,7 +371,7 @@ class TestPinnedVersionDownload(unittest.TestCase):
         self.assertEqual(Model.updateSoftware(target), SETUP_LAUNCHED)
 
         self.assertIn(tag_url, requested)
-        self.assertNotIn(self.BETA_MAIN, requested)
+        self.assertNotIn(self.STABLE_LATEST, requested)
         popen.assert_called_once()
         args = popen.call_args.args[0]
         self.assertIn(f"/VERSION={target}", args)
@@ -385,25 +382,54 @@ class TestPinnedVersionDownload(unittest.TestCase):
     @patch("model.psutil_Process")
     @patch("model.Popen")
     @patch("model.requests_get")
-    def test_legacy_release_without_tagged_setup_falls_back_to_latest_installer(
+    def test_release_without_sidecar_uses_its_own_setup_with_size_check_only(
         self, requests_get: Mock, popen: Mock, psutil_process: Mock, os_exit: Mock
     ) -> None:
-        # .sha256 も HF のタグ上の setup.exe も無い版 (3.4.3 などの旧版がそうだった)。
-        # インストーラは /VERSION で入れる版を決めるので、main のものを (サイズ検証だけで) 使う
         target = "3.6.0"
+        tag_url = config.setupDownloadUrl("v3.6.0")
         requested: list = []
         requests_get.side_effect = self._fake_get(
             [self._release(target, "v3.6.0", False)],
-            {self.STABLE_MAIN: _make_download_response(self.payload)},
+            {
+                tag_url: _make_download_response(self.payload),
+                self.STABLE_LATEST: _make_download_response(self.payload),
+            },
             requested,
         )
 
-        with patch("model.errorLogging"):
+        with patch("model.errorLogging"), patch("model.printLog"):
             self.assertEqual(Model.updateSoftware(target), SETUP_LAUNCHED)
 
-        self.assertIn(config.setupDownloadUrl(target, tag="v3.6.0"), requested)
-        self.assertIn(self.STABLE_MAIN, requested)
+        self.assertIn(tag_url, requested)
+        self.assertNotIn(self.STABLE_LATEST, requested)
         self.assertIn(f"/VERSION={target}", popen.call_args.args[0])
+
+    @patch("model.os_exit")
+    @patch("model.psutil_Process")
+    @patch("model.Popen")
+    @patch("model.requests_get")
+    def test_package_sidecars_are_not_mistaken_for_the_setup_sidecar(
+        self, requests_get: Mock, popen: Mock, psutil_process: Mock, os_exit: Mock
+    ) -> None:
+        # リリースには VRCT.zip.sha256 なども並ぶ。setup.exe のものだけで検証する
+        target = "3.6.0"
+        release = self._release(target, "v3.6.0", True)
+        release["assets"].insert(0, {
+            "name": "VRCT.zip.sha256",
+            "browser_download_url": "https://example.invalid/zip.sha256",
+        })
+        tag_url = config.setupDownloadUrl("v3.6.0")
+        requests_get.side_effect = self._fake_get(
+            [release],
+            {
+                "https://example.invalid/zip.sha256": _make_text_response("0" * 64),
+                f"https://example.invalid/{target}.sha256": _make_text_response(self.sha256),
+                tag_url: _make_download_response(self.payload),
+            },
+            [],
+        )
+
+        self.assertEqual(Model.updateSoftware(target), SETUP_LAUNCHED)
 
     @patch("model.Popen")
     @patch("model.requests_get")
@@ -419,7 +445,7 @@ class TestPinnedVersionDownload(unittest.TestCase):
             [self._release(target, "v3.6.0-beta.1", True)],
             {
                 f"https://example.invalid/{target}.sha256": _make_text_response(self.sha256),
-                self.BETA_MAIN: _make_download_response(self.payload),
+                self.STABLE_LATEST: _make_download_response(self.payload),
             },
             requested,
         )
@@ -427,7 +453,7 @@ class TestPinnedVersionDownload(unittest.TestCase):
         with patch("model.errorLogging"):
             self.assertEqual(Model.updateSoftware(target), SETUP_DOWNLOAD_FAILED)
 
-        self.assertNotIn(self.BETA_MAIN, requested)
+        self.assertNotIn(self.STABLE_LATEST, requested)
         popen.assert_not_called()
 
     @patch("model.Popen")
@@ -436,7 +462,7 @@ class TestPinnedVersionDownload(unittest.TestCase):
         self, requests_get: Mock, popen: Mock
     ) -> None:
         target = "3.6.0-beta.1"
-        tag_url = config.setupDownloadUrl(target, tag="v3.6.0-beta.1")
+        tag_url = config.setupDownloadUrl("v3.6.0-beta.1")
         requests_get.side_effect = self._fake_get(
             [self._release(target, "v3.6.0-beta.1", True)],
             {
@@ -488,6 +514,21 @@ class TestPinnedVersionDownload(unittest.TestCase):
         self.assertEqual(Model.updateSoftware("3.5.1"), SETUP_DOWNLOAD_FAILED)
 
         requests_get.assert_not_called()
+        popen.assert_not_called()
+
+    @patch("model.Popen")
+    @patch("model.requests_get")
+    def test_beta_latest_is_not_replaced_by_stable_when_releases_are_unreachable(
+        self, requests_get: Mock, popen: Mock
+    ) -> None:
+        # releases/latest は stable しか指さないので、beta の最新が分からなければ中止する
+        requests_get.side_effect = Exception("network error")
+
+        with patch.object(type(config), "SELECTED_RELEASE_CHANNEL", "beta"),                 patch("model.errorLogging"), patch("model.printLog"):
+            self.assertEqual(Model.updateSoftware(), SETUP_DOWNLOAD_FAILED)
+
+        requested = [c.args[0] for c in requests_get.call_args_list]
+        self.assertNotIn(self.STABLE_LATEST, requested)
         popen.assert_not_called()
 
 

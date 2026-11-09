@@ -760,8 +760,10 @@ Section Install
 
   !addplugindir "..\..\..\..\nsis\plugins\x86-unicode"
   ; 指定のURLからファイルをダウンロード
-  !define SOFTWARE_RELEASE_REPO "ms-software/VRCT"
-  !define SOFTWARE_RELEASE_REPO_BETA "ms-software/VRCT-beta"
+  ; Packages are GitHub release assets: <base>/<tag>/<file>. GitHub caps an
+  ; asset at 2 GiB, so release.yml splits each package into <file>.001,
+  ; <file>.002, ... and publishes the part count as <file>.parts.
+  !define SOFTWARE_RELEASE_URL "https://github.com/matty/VRCT/releases/download"
   !define SOFTWARE_DOWNLOAD_FILENAME "VRCT.zip"
   !define SOFTWARE_DOWNLOAD_FILENAME_GPU "VRCT_cuda.zip"
 
@@ -773,7 +775,9 @@ Section Install
   ; bump them when the packages grow.
   !define REQ_DOWNLOAD_MB_CPU 1024
   !define REQ_EXTRACT_MB_CPU 3072
-  !define REQ_DOWNLOAD_MB_GPU 4096
+  ; GPU: the parts are appended onto the archive one at a time, so the peak is
+  ; the archive plus one 1 GiB part.
+  !define REQ_DOWNLOAD_MB_GPU 6144
   !define REQ_EXTRACT_MB_GPU 7168
 
   Var /GLOBAL i
@@ -785,10 +789,14 @@ Section Install
   Var /GLOBAL dl_tick
   Var /GLOBAL dl_percent
   Var /GLOBAL dl_xfersize
-  Var /GLOBAL release_revision
-  Var /GLOBAL release_repo
-  Var /GLOBAL effective_version
-  Var /GLOBAL beta_marker_pos
+  Var /GLOBAL release_base
+  Var /GLOBAL part_count
+  Var /GLOBAL part_index
+  Var /GLOBAL part_name
+  Var /GLOBAL dl_url
+  Var /GLOBAL dl_out
+  Var /GLOBAL dl_result
+  Var /GLOBAL dl_force_single
   Var /GLOBAL req_dl_mb
   Var /GLOBAL req_extract_mb
   Var /GLOBAL dl_total
@@ -846,43 +854,22 @@ Section Install
     ${EndIf}
   ${EndIf}
 
-  ; Pin to a specific released version's HF tag (e.g. "/VERSION=3.4.2" -> tag
-  ; "v3.4.2", or typed into the release-channel page) when requested for
-  ; rollback; otherwise fetch the latest from the selected channel's "main".
+  ; Each setup.exe is attached to its own GitHub release and installs that
+  ; release's package. The in-app updater downloads the setup.exe of the
+  ; release it wants (latest of the user's channel, or a picked version), and
+  ; "/VERSION=" can still pin another release explicitly.
   ${If} $TargetVersion != ""
-    StrCpy $release_revision "v$TargetVersion"
-    StrCpy $effective_version $TargetVersion
-
-    ; Beta versions (e.g. "3.5.0-beta.1") are published to a separate HF repo,
-    ; not the production one -- an explicit pinned version routes by its own
-    ; string, regardless of which channel radio button is selected, since a
-    ; given tag only ever exists in one of the two repos.
-    ${StrLoc} $beta_marker_pos $effective_version "-beta" ">"
-    ${If} $beta_marker_pos == ""
-      ${StrLoc} $beta_marker_pos $effective_version "-rc" ">"
-    ${EndIf}
-    ${If} $beta_marker_pos == ""
-      StrCpy $release_repo "${SOFTWARE_RELEASE_REPO}"
-    ${Else}
-      StrCpy $release_repo "${SOFTWARE_RELEASE_REPO_BETA}"
-    ${EndIf}
+    StrCpy $release_base "${SOFTWARE_RELEASE_URL}/v$TargetVersion"
   ${Else}
-    ; No specific version pinned -- fetch the latest from whichever channel
-    ; the user picked on the release-channel page.
-    StrCpy $release_revision "main"
-    ${If} $SelectedChannel == "beta"
-      StrCpy $release_repo "${SOFTWARE_RELEASE_REPO_BETA}"
-    ${Else}
-      StrCpy $release_repo "${SOFTWARE_RELEASE_REPO}"
-    ${EndIf}
+    StrCpy $release_base "${SOFTWARE_RELEASE_URL}/v${VERSION}"
   ${EndIf}
 
-  StrCpy $cmder_dl "https://huggingface.co/$release_repo/resolve/$release_revision/$file_name"
+  StrCpy $cmder_dl "$release_base/$file_name"
   DetailPrint "Got URL : $cmder_dl"
 
   ; NScurl and curl.exe (libcurl) ignore the Windows proxy setting, which is
   ; where VPN tools in "system proxy" mode point browsers. Without it they
-  ; connect directly and fail where Hugging Face is blocked (issue #124).
+  ; connect directly and fail where the download host is blocked (issue #124).
   ; libcurl does read HTTPS_PROXY, so pass the setting on through it, unless
   ; the user already set a proxy for curl.
   ; ponytail: a PAC script (AutoConfigURL) is not followed; setting HTTPS_PROXY by hand works there.
@@ -961,6 +948,34 @@ Section Install
 
   package_hash_ready:
 
+  ; Number of parts the package was split into (see SOFTWARE_RELEASE_URL).
+  StrCpy $R9 "$TEMP\$file_name.parts"
+  Delete "$R9"
+  DetailPrint "Downloading package manifest..."
+  NScurl::http GET "$cmder_dl.parts" "$R9" /BACKGROUND /COMPLETETIMEOUT 30s /END
+  Pop $0
+  NScurl::wait /ID $0 /END
+  NScurl::query /ID $0 "@ERROR@"
+  Pop $1
+  StrCpy $part_count 0
+  ${If} $1 == "OK"
+    ClearErrors
+    FileOpen $0 "$R9" r
+    ${IfNot} ${Errors}
+      FileRead $0 $1
+      FileClose $0
+      IntOp $part_count $1 + 0
+    ${EndIf}
+  ${EndIf}
+  Delete "$R9"
+  ${If} $part_count < 1
+  ${OrIf} $part_count > 99
+    DetailPrint "Could not read the package manifest ($cmder_dl.parts)"
+    MessageBox MB_OK|MB_ICONSTOP "Could not download the package manifest for $file_name.$\r$\n$\r$\nCheck your connection and run the installer again." /SD IDOK
+    Abort
+  ${EndIf}
+  DetailPrint "Package is published in $part_count part(s)"
+
   ; The archive is unpacked with Windows' bundled bsdtar (see below). Bail out
   ; early with a clear message if it is missing rather than downloading GBs
   ; first only to fail at the end. This installer is 32-bit, so $SYSDIR is
@@ -979,210 +994,46 @@ Section Install
     Abort
   ${EndIf}
 
-  ; Probe the total size so the download can be split into byte ranges.
-  ; $SYSDIR\curl.exe shares tar.exe's Windows baseline (checked above); if the
-  ; probe fails, $dl_total stays "0" and a single stream is used instead.
-  StrCpy $dl_total "0"
-  ${DisableX64FSRedirection}
-  nsExec::ExecToStack '"$SYSDIR\curl.exe" -sIL --fail --retry 2 -o NUL -w "%header{content-length}" "$cmder_dl"'
-  Pop $0
-  Pop $1
-  ${EnableX64FSRedirection}
-  ${If} $0 == 0
-    System::Int64Op $1 + 0        ; keep leading digits, drop any trailing CR/LF
-    Pop $dl_total
-  ${EndIf}
-
-  ; Use the parallel path only when the size is known AND the download volume
-  ; can clearly hold the parts + the reassembled archive + the extracted tree
-  ; at once (2x archive during "copy /b" + the unpacked size + margin). On a
-  ; tighter disk, or if any parallel part fails at runtime, we fall back to a
-  ; single stream (1x archive) which the pre-flight check above already sized.
-  StrCpy $dl_parallel "0"
-  ${If} $dl_total != "0"
-    ${GetRoot} "$TEMP" $R0
-    ${DriveSpace} "$R0\" "/D=F /S=M" $R1
-    System::Int64Op $dl_total / 524288      ; = 2 * archive size in MiB
-    Pop $R2
-    IntOp $R2 $R2 + $req_extract_mb
-    IntOp $R2 $R2 + 1024                    ; margin
-    ${If} $R1 != ""
-    ${AndIf} $R1 > $R2
-      StrCpy $dl_parallel "1"
-    ${EndIf}
-  ${EndIf}
-
   ; Download + extract is retried as a single unit: a transfer the downloader
-  ; reports as OK can still be truncated (the HuggingFace CDN does this on
-  ; multi-GB files), which only surfaces when the unpack fails. So on ANY
-  ; failure (download error, or an unpack that yields no ${MAINBINARYNAME}.exe)
-  ; we wipe the archive and pull a completely fresh copy.
+  ; reports as OK can still be truncated on multi-GB files, which only
+  ; surfaces when the unpack fails. So on ANY failure (download error, or an
+  ; unpack that yields no ${MAINBINARYNAME}.exe) we wipe the archive and pull
+  ; a completely fresh copy.
   StrCpy $dl_retries 0
+  StrCpy $dl_force_single "0"
   install_attempt:
     Delete "$TEMP\$file_name"
-    Delete "$TEMP\$file_name.p0"
-    Delete "$TEMP\$file_name.p1"
-    Delete "$TEMP\$file_name.p2"
-    Delete "$TEMP\$file_name.p3"
 
-    ${If} $dl_parallel != "1"
-      ; -------- Single connection (size unknown, tight disk, or retry) --------
-      DetailPrint "Downloading $file_name..."
-      NScurl::http GET "$cmder_dl" "$TEMP\$file_name" /INSIST /RESUME /BACKGROUND /END
-      Pop $dl_transfer_id
-      StrCpy $dl_tick 0
-      StrCpy $R4 0
-      download_wait:
-        Sleep 1000
-        NScurl::query /ID $dl_transfer_id "@STATUS@"
-        Pop $0
-        ${If} $0 == "Complete"
-          Goto single_download_done
-        ${ElseIf} $0 == "Waiting"
-        ${OrIf} $0 == "Running"
-          IntOp $R4 $R4 + 1
-          IntOp $dl_tick $dl_tick + 1
-          ${If} $dl_tick >= 5
-            StrCpy $dl_tick 0
-            NScurl::query /ID $dl_transfer_id "@PERCENT@"
-            Pop $dl_percent
-            NScurl::query /ID $dl_transfer_id "@XFERSIZE@"
-            Pop $dl_xfersize
-            DetailPrint "Downloading $file_name... $dl_xfersize ($dl_percent%)"
-          ${EndIf}
-          ${If} $R4 >= 3600
-            DetailPrint "Download timed out"
-            Goto attempt_failed
-          ${EndIf}
-          Goto download_wait
-        ${Else}
-          DetailPrint "Download stopped with status $0"
-          Goto attempt_failed
-        ${EndIf}
-      single_download_done:
-      NScurl::wait /ID $dl_transfer_id /END
-      NScurl::query /ID $dl_transfer_id "@ERROR@"
-      Pop $0
-      ${If} $0 != "OK"
-        DetailPrint "Download failed ($0)"
+    ; Parts are fetched one at a time and appended onto $TEMP\$file_name, so
+    ; at most one part sits on disk next to the growing archive.
+    StrCpy $part_index 1
+    part_loop:
+      IntFmt $part_name "%03d" $part_index
+      StrCpy $part_name "$file_name.$part_name"
+      StrCpy $dl_url "$release_base/$part_name"
+      StrCpy $dl_out "$TEMP\$part_name"
+      DetailPrint "Got URL : $dl_url"
+      Call DownloadPart
+      ${If} $dl_result != "OK"
+        Delete "$dl_out"
         Goto attempt_failed
       ${EndIf}
-    ${Else}
-      ; -------- 4 byte ranges pulled concurrently, then reassembled --------
-      ; $R0 = chunk, $R2 = 2*chunk (part2 start), $R3 = 3*chunk (part3 start),
-      ; $R1 = scratch (range end), $R4 = watchdog tick. The last range is
-      ; open-ended so it always covers the remainder.
-      DetailPrint "Downloading $file_name (4 parallel connections)..."
-      System::Int64Op $dl_total / 4
-      Pop $R0
-      System::Int64Op $R0 - 1
-      Pop $R1
-      NScurl::http GET "$cmder_dl" "$TEMP\$file_name.p0" /HEADER "Range: bytes=0-$R1" /INSIST /BACKGROUND /END
-      Pop $dl_id0
-      System::Int64Op $R0 * 2
-      Pop $R2
-      System::Int64Op $R2 - 1
-      Pop $R1
-      NScurl::http GET "$cmder_dl" "$TEMP\$file_name.p1" /HEADER "Range: bytes=$R0-$R1" /INSIST /BACKGROUND /END
-      Pop $dl_id1
-      System::Int64Op $R0 * 3
-      Pop $R3
-      System::Int64Op $R3 - 1
-      Pop $R1
-      NScurl::http GET "$cmder_dl" "$TEMP\$file_name.p2" /HEADER "Range: bytes=$R2-$R1" /INSIST /BACKGROUND /END
-      Pop $dl_id2
-      NScurl::http GET "$cmder_dl" "$TEMP\$file_name.p3" /HEADER "Range: bytes=$R3-" /INSIST /BACKGROUND /END
-      Pop $dl_id3
-
-      StrCpy $dl_tick 0
-      StrCpy $R4 0
-      par_wait:
-        Sleep 1000
-        IntOp $R4 $R4 + 1
-        NScurl::query /ID $dl_id0 "@STATUS@"
-        Pop $1
-        NScurl::query /ID $dl_id1 "@STATUS@"
-        Pop $2
-        NScurl::query /ID $dl_id2 "@STATUS@"
-        Pop $3
-        NScurl::query /ID $dl_id3 "@STATUS@"
-        Pop $4
-        ${If} $1 == "Aborted"
-        ${OrIf} $2 == "Aborted"
-        ${OrIf} $3 == "Aborted"
-        ${OrIf} $4 == "Aborted"
-          DetailPrint "A download connection was aborted"
-          Goto par_failed
+      ${If} $part_index == 1
+        Rename "$dl_out" "$TEMP\$file_name"
+      ${Else}
+        DetailPrint "Appending $part_name..."
+        nsExec::ExecToLog 'cmd /c copy /b "$TEMP\$file_name"+"$dl_out" "$TEMP\$file_name"'
+        Pop $0
+        Delete "$dl_out"
+        ${If} $0 != 0
+          DetailPrint "Could not append $part_name (exit $0)"
+          Goto attempt_failed
         ${EndIf}
-        ${If} $R4 > 3600
-          DetailPrint "Download timed out"
-          Goto par_failed
-        ${EndIf}
-        IntOp $dl_tick $dl_tick + 1
-        ${If} $dl_tick >= 3
-          StrCpy $dl_tick 0
-          NScurl::query /ID $dl_id0 "@XFERSIZE_B@"
-          Pop $5
-          NScurl::query /ID $dl_id1 "@XFERSIZE_B@"
-          Pop $6
-          System::Int64Op $5 + $6
-          Pop $5
-          NScurl::query /ID $dl_id2 "@XFERSIZE_B@"
-          Pop $6
-          System::Int64Op $5 + $6
-          Pop $5
-          NScurl::query /ID $dl_id3 "@XFERSIZE_B@"
-          Pop $6
-          System::Int64Op $5 + $6
-          Pop $5
-          System::Int64Op $5 / 1048576
-          Pop $7
-          System::Int64Op $5 * 100
-          Pop $8
-          System::Int64Op $8 / $dl_total
-          Pop $8
-          System::Int64Op $dl_total / 1048576
-          Pop $9
-          DetailPrint "Downloading $file_name... $7 / $9 MB ($8%)"
-        ${EndIf}
-        StrCmp "$1$2$3$4" "CompleteCompleteCompleteComplete" par_done 0
-        Goto par_wait
-      par_done:
-      NScurl::query /ID $dl_id0 "@ERROR@"
-      Pop $1
-      NScurl::query /ID $dl_id1 "@ERROR@"
-      Pop $2
-      NScurl::query /ID $dl_id2 "@ERROR@"
-      Pop $3
-      NScurl::query /ID $dl_id3 "@ERROR@"
-      Pop $4
-      ${If} $1 != "OK"
-      ${OrIf} $2 != "OK"
-      ${OrIf} $3 != "OK"
-      ${OrIf} $4 != "OK"
-        DetailPrint "Parallel download failed ($1 / $2 / $3 / $4)"
-        Goto par_failed
       ${EndIf}
-      DetailPrint "Combining parts..."
-      nsExec::ExecToLog 'cmd /c copy /b "$TEMP\$file_name.p0"+"$TEMP\$file_name.p1"+"$TEMP\$file_name.p2"+"$TEMP\$file_name.p3" "$TEMP\$file_name"'
-      Pop $0
-      ${If} $0 != 0
-        DetailPrint "Could not combine downloaded parts (exit $0)"
-        Goto par_failed
+      IntOp $part_index $part_index + 1
+      ${If} $part_index <= $part_count
+        Goto part_loop
       ${EndIf}
-      Delete "$TEMP\$file_name.p0"
-      Delete "$TEMP\$file_name.p1"
-      Delete "$TEMP\$file_name.p2"
-      Delete "$TEMP\$file_name.p3"
-      Goto par_ok
-    par_failed:
-      ; A parallel part failed (often disk-write pressure from 4 concurrent
-      ; writers). Drop to a single connection for the remaining attempts.
-      DetailPrint "Retrying with a single connection..."
-      StrCpy $dl_parallel "0"
-      Goto attempt_failed
-    par_ok:
-    ${EndIf}
 
     ${If} $package_hash_available == "1"
       NScurl::sha256 -file "$TEMP\$file_name"
@@ -1284,6 +1135,216 @@ Section Install
   ; Auto close this page for passive mode
   ${IfThen} $PassiveMode == 1 ${|} SetAutoClose true ${|}
 SectionEnd
+
+; Downloads one package part. In: $dl_url, $dl_out, $part_name.
+; Out: $dl_result = "OK" or "FAIL". Sets $dl_force_single after a failed
+; parallel attempt so later attempts use a single connection.
+Function DownloadPart
+  StrCpy $dl_result "FAIL"
+  Delete "$dl_out"
+  Delete "$dl_out.p0"
+  Delete "$dl_out.p1"
+  Delete "$dl_out.p2"
+  Delete "$dl_out.p3"
+
+  ; Probe the size so the download can be split into byte ranges.
+  ; $SYSDIR\curl.exe shares tar.exe's Windows baseline (checked earlier); if
+  ; the probe fails, $dl_total stays "0" and a single stream is used instead.
+  StrCpy $dl_total "0"
+  ${DisableX64FSRedirection}
+  nsExec::ExecToStack '"$SYSDIR\curl.exe" -sIL --fail --retry 2 -o NUL -w "%header{content-length}" "$dl_url"'
+  Pop $0
+  Pop $1
+  ${EnableX64FSRedirection}
+  ${If} $0 == 0
+    System::Int64Op $1 + 0        ; keep leading digits, drop any trailing CR/LF
+    Pop $dl_total
+  ${EndIf}
+
+  ; Use the parallel path only when the size is known AND the download volume
+  ; can clearly hold the range files + the reassembled part + the extracted
+  ; tree at once (2x part during "copy /b" + the unpacked size + margin). On a
+  ; tighter disk, or after a parallel attempt failed, use a single stream.
+  StrCpy $dl_parallel "0"
+  ${If} $dl_total != "0"
+  ${AndIf} $dl_force_single != "1"
+    ${GetRoot} "$TEMP" $R0
+    ${DriveSpace} "$R0\" "/D=F /S=M" $R1
+    System::Int64Op $dl_total / 524288      ; = 2 * part size in MiB
+    Pop $R2
+    IntOp $R2 $R2 + $req_extract_mb
+    IntOp $R2 $R2 + 1024                    ; margin
+    ${If} $R1 != ""
+    ${AndIf} $R1 > $R2
+      StrCpy $dl_parallel "1"
+    ${EndIf}
+  ${EndIf}
+
+  ${If} $dl_parallel != "1"
+    ; -------- Single connection (size unknown, tight disk, or retry) --------
+    DetailPrint "Downloading $part_name..."
+    NScurl::http GET "$dl_url" "$dl_out" /INSIST /RESUME /BACKGROUND /END
+    Pop $dl_transfer_id
+    StrCpy $dl_tick 0
+    StrCpy $R4 0
+    download_wait:
+      Sleep 1000
+      NScurl::query /ID $dl_transfer_id "@STATUS@"
+      Pop $0
+      ${If} $0 == "Complete"
+        Goto single_download_done
+      ${ElseIf} $0 == "Waiting"
+      ${OrIf} $0 == "Running"
+        IntOp $R4 $R4 + 1
+        IntOp $dl_tick $dl_tick + 1
+        ${If} $dl_tick >= 5
+          StrCpy $dl_tick 0
+          NScurl::query /ID $dl_transfer_id "@PERCENT@"
+          Pop $dl_percent
+          NScurl::query /ID $dl_transfer_id "@XFERSIZE@"
+          Pop $dl_xfersize
+          DetailPrint "Downloading $part_name... $dl_xfersize ($dl_percent%)"
+        ${EndIf}
+        ${If} $R4 >= 3600
+          DetailPrint "Download timed out"
+          Return
+        ${EndIf}
+        Goto download_wait
+      ${Else}
+        DetailPrint "Download stopped with status $0"
+        Return
+      ${EndIf}
+    single_download_done:
+    NScurl::wait /ID $dl_transfer_id /END
+    NScurl::query /ID $dl_transfer_id "@ERROR@"
+    Pop $0
+    ${If} $0 != "OK"
+      DetailPrint "Download failed ($0)"
+      Return
+    ${EndIf}
+    StrCpy $dl_result "OK"
+    Return
+  ${EndIf}
+
+  ; -------- 4 byte ranges pulled concurrently, then reassembled --------
+  ; $R0 = chunk, $R2 = 2*chunk (part2 start), $R3 = 3*chunk (part3 start),
+  ; $R1 = scratch (range end), $R4 = watchdog tick. The last range is
+  ; open-ended so it always covers the remainder.
+  DetailPrint "Downloading $part_name (4 parallel connections)..."
+  System::Int64Op $dl_total / 4
+  Pop $R0
+  System::Int64Op $R0 - 1
+  Pop $R1
+  NScurl::http GET "$dl_url" "$dl_out.p0" /HEADER "Range: bytes=0-$R1" /INSIST /BACKGROUND /END
+  Pop $dl_id0
+  System::Int64Op $R0 * 2
+  Pop $R2
+  System::Int64Op $R2 - 1
+  Pop $R1
+  NScurl::http GET "$dl_url" "$dl_out.p1" /HEADER "Range: bytes=$R0-$R1" /INSIST /BACKGROUND /END
+  Pop $dl_id1
+  System::Int64Op $R0 * 3
+  Pop $R3
+  System::Int64Op $R3 - 1
+  Pop $R1
+  NScurl::http GET "$dl_url" "$dl_out.p2" /HEADER "Range: bytes=$R2-$R1" /INSIST /BACKGROUND /END
+  Pop $dl_id2
+  NScurl::http GET "$dl_url" "$dl_out.p3" /HEADER "Range: bytes=$R3-" /INSIST /BACKGROUND /END
+  Pop $dl_id3
+
+  StrCpy $dl_tick 0
+  StrCpy $R4 0
+  par_wait:
+    Sleep 1000
+    IntOp $R4 $R4 + 1
+    NScurl::query /ID $dl_id0 "@STATUS@"
+    Pop $1
+    NScurl::query /ID $dl_id1 "@STATUS@"
+    Pop $2
+    NScurl::query /ID $dl_id2 "@STATUS@"
+    Pop $3
+    NScurl::query /ID $dl_id3 "@STATUS@"
+    Pop $4
+    ${If} $1 == "Aborted"
+    ${OrIf} $2 == "Aborted"
+    ${OrIf} $3 == "Aborted"
+    ${OrIf} $4 == "Aborted"
+      DetailPrint "A download connection was aborted"
+      Goto par_failed
+    ${EndIf}
+    ${If} $R4 > 3600
+      DetailPrint "Download timed out"
+      Goto par_failed
+    ${EndIf}
+    IntOp $dl_tick $dl_tick + 1
+    ${If} $dl_tick >= 3
+      StrCpy $dl_tick 0
+      NScurl::query /ID $dl_id0 "@XFERSIZE_B@"
+      Pop $5
+      NScurl::query /ID $dl_id1 "@XFERSIZE_B@"
+      Pop $6
+      System::Int64Op $5 + $6
+      Pop $5
+      NScurl::query /ID $dl_id2 "@XFERSIZE_B@"
+      Pop $6
+      System::Int64Op $5 + $6
+      Pop $5
+      NScurl::query /ID $dl_id3 "@XFERSIZE_B@"
+      Pop $6
+      System::Int64Op $5 + $6
+      Pop $5
+      System::Int64Op $5 / 1048576
+      Pop $7
+      System::Int64Op $5 * 100
+      Pop $8
+      System::Int64Op $8 / $dl_total
+      Pop $8
+      System::Int64Op $dl_total / 1048576
+      Pop $9
+      DetailPrint "Downloading $part_name... $7 / $9 MB ($8%)"
+    ${EndIf}
+    StrCmp "$1$2$3$4" "CompleteCompleteCompleteComplete" par_done 0
+    Goto par_wait
+  par_done:
+  NScurl::query /ID $dl_id0 "@ERROR@"
+  Pop $1
+  NScurl::query /ID $dl_id1 "@ERROR@"
+  Pop $2
+  NScurl::query /ID $dl_id2 "@ERROR@"
+  Pop $3
+  NScurl::query /ID $dl_id3 "@ERROR@"
+  Pop $4
+  ${If} $1 != "OK"
+  ${OrIf} $2 != "OK"
+  ${OrIf} $3 != "OK"
+  ${OrIf} $4 != "OK"
+    DetailPrint "Parallel download failed ($1 / $2 / $3 / $4)"
+    Goto par_failed
+  ${EndIf}
+  DetailPrint "Combining ranges..."
+  nsExec::ExecToLog 'cmd /c copy /b "$dl_out.p0"+"$dl_out.p1"+"$dl_out.p2"+"$dl_out.p3" "$dl_out"'
+  Pop $0
+  ${If} $0 != 0
+    DetailPrint "Could not combine downloaded ranges (exit $0)"
+    Goto par_failed
+  ${EndIf}
+  Delete "$dl_out.p0"
+  Delete "$dl_out.p1"
+  Delete "$dl_out.p2"
+  Delete "$dl_out.p3"
+  StrCpy $dl_result "OK"
+  Return
+
+  par_failed:
+  ; A range failed (often disk-write pressure from 4 concurrent writers).
+  ; Drop to a single connection for the remaining attempts.
+  DetailPrint "Retrying with a single connection..."
+  StrCpy $dl_force_single "1"
+  Delete "$dl_out.p0"
+  Delete "$dl_out.p1"
+  Delete "$dl_out.p2"
+  Delete "$dl_out.p3"
+FunctionEnd
 
 Function CleanupFailedInstall
   ; Keep the .bad archive for diagnostics, but remove temporary fragments and

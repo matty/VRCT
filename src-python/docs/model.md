@@ -966,7 +966,7 @@ return {
 **責務:** CPU版へのアップデート/切替実行
 
 **処理:**
-1. Hugging Faceから `VRCT_setup.exe`（NSISインストーラー）をダウンロード（最大5回リトライ）
+1. GitHub Release から `VRCT_setup.exe`（NSISインストーラー）をダウンロード（最大5回リトライ）
 2. `Popen(["VRCT_setup.exe", "/EDITION=cpu"])` でセットアップウィザードを起動（CPU版が初期選択された状態で表示される）
 3. 実行中のVRCT本体の終了確認・再起動は起動されたセットアップウィザード側が行う
 

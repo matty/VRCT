@@ -729,10 +729,11 @@ class Config:
     _debounce_time: int = 2
     _file_lock: threading.Lock = threading.Lock()
 
-    # Hugging Face repos hosting the NSIS setup.exe per release channel; see
-    # docs/readme_build.md "β版リリース" and .github/workflows/release.yml.
-    _HF_REPO_STABLE = "ms-software/VRCT"
-    _HF_REPO_BETA = "ms-software/VRCT-beta"
+    # GitHub repo whose releases host VRCT_setup.exe and the app packages
+    # (stable releases and beta prereleases alike); see
+    # .github/workflows/release.yml.
+    _GITHUB_REPO = "matty/VRCT"
+    SETUP_ASSET_NAME = "VRCT_setup.exe"
 
     # VERSION に含まれていれば beta チャンネル扱いとする接尾辞。NSIS
     # インストーラの .onInit (template.nsi) が ${VERSION} に対して行って
@@ -756,17 +757,16 @@ class Config:
     GROQ_WHISPER_BASE_URL = "https://api.groq.com/openai/v1"
     OPENAI_WHISPER_BASE_URL = "https://api.openai.com/v1"
 
-    def setupDownloadUrl(self, target_version: Optional[str] = None, tag: Optional[str] = None) -> str:
-        """setup.exe のダウンロード URL。
+    def setupDownloadUrl(self, tag: Optional[str] = None) -> str:
+        """setup.exe のダウンロード URL (GitHub Release のアセット)。
 
-        tag を指定すると、そのリリースのタグ (release.yml が Hugging Face のリポジトリへ
-        GitHub のタグと同じ名前で付ける) を指す。無ければ main (そのチャンネルの最新版)。
-        target_version を指定すると、リポジトリはそのバージョンのチャンネルで決める
-        (指定が無ければ現在のチャンネル)。
+        tag を指定するとそのリリースのもの。無ければ最新の stable リリースのもの
+        (GitHub の releases/latest は prerelease を含まない)。
         """
-        channel = self._channelForVersion(target_version) if target_version else self.SELECTED_RELEASE_CHANNEL
-        repo = self._HF_REPO_BETA if channel == "beta" else self._HF_REPO_STABLE
-        return f"https://huggingface.co/{repo}/resolve/{tag or 'main'}/VRCT_setup.exe"
+        base = f"https://github.com/{self._GITHUB_REPO}/releases"
+        if tag:
+            return f"{base}/download/{tag}/{self.SETUP_ASSET_NAME}"
+        return f"{base}/latest/download/{self.SETUP_ASSET_NAME}"
 
     def __new__(cls):
         if cls._instance is None:
@@ -1092,8 +1092,8 @@ class Config:
         self._PATH_CONFIG = os_path.join(self._PATH_LOCAL, "config.json")
         self._PATH_LOGS = os_path.join(self._PATH_LOCAL, "logs")
         os_makedirs(self._PATH_LOGS, exist_ok=True)
-        self._GITHUB_URL = "https://api.github.com/repos/misyaguziya/VRCT/releases/latest"
-        self._GITHUB_RELEASES_LIST_URL = "https://api.github.com/repos/misyaguziya/VRCT/releases"
+        self._GITHUB_URL = f"https://api.github.com/repos/{self._GITHUB_REPO}/releases/latest"
+        self._GITHUB_RELEASES_LIST_URL = f"https://api.github.com/repos/{self._GITHUB_REPO}/releases"
         # The version picker UI exists from 3.6.0; older releases are hidden so
         # users can't switch to a build they can't switch back from.
         # Prereleases of this version (3.6.0-beta.N) are included.

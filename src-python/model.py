@@ -1852,7 +1852,8 @@ class Model:
 
     # setup.exe と一緒に CI が公開する SHA-256 サイドカーアセットのファイル名
     # サフィックス。release.yml 側で <installer名>.sha256 という名前で
-    # 追加アップロードしている前提。
+    # 追加アップロードしている前提。リリースには VRCT.zip.sha256 などの
+    # パッケージ用サイドカーも並ぶので、setup.exe のものだけを使う。
     _SHA256_ASSET_SUFFIX = ".sha256"
     # ".sha256" サイドカー (数十バイトの小さなファイル) の取得リトライ回数。
     # これ1つの一時的な通信失敗で更新全体を止めてしまわないための保険。
@@ -1915,6 +1916,7 @@ class Model:
             if isinstance(asset, dict)
             and isinstance(asset.get("name"), str)
             and asset["name"].endswith(Model._SHA256_ASSET_SUFFIX)
+            and "setup.exe" in asset["name"]
             and isinstance(asset.get("browser_download_url"), str)
         ]
         if not sidecar_urls:
@@ -2026,22 +2028,18 @@ class Model:
                 f"{target_version or 'the latest release'}); falling back to size-only validation"
             )
 
-        # 指定バージョンは、そのリリースの setup.exe (HF の同名タグ) を取る。main は常に
-        # 最新版なので、指定バージョンのハッシュで検証すると最新版以外では必ず不一致になる。
-        urls = [config.setupDownloadUrl()]
-        if target_version:
-            tag = release.get("tag_name") if isinstance(release, dict) else None
-            urls = [config.setupDownloadUrl(target_version, tag=tag or f"v{target_version}")]
-            if expected_sha256 is None:
-                # 古いリリース (3.4.x など) は HF のタグに setup.exe が無い。インストーラは
-                # /VERSION で入れる版を決めるので、検証できない場合に限り最新のものを使う
-                urls.append(config.setupDownloadUrl(target_version))
-        failure = SETUP_DOWNLOAD_FAILED
-        for url in urls:
-            failure = Model._downloadSetup(expected_sha256, url)
-            if failure != SETUP_DOWNLOAD_FAILED:
-                return failure
-        return failure
+        # 解決したリリースに添付された setup.exe を取る。ハッシュはそのリリースのもの
+        # なので、別のリリースの setup.exe では一致しない。setup.exe は自分のリリースの
+        # パッケージを入れる。リリースを解決できなかったときは、指定版ならそのタグ、
+        # 最新なら最新の stable リリースのものを取る。
+        tag = release.get("tag_name") if isinstance(release, dict) else None
+        if not isinstance(tag, str) or not tag:
+            if target_version:
+                tag = f"v{target_version}"
+            elif config.SELECTED_RELEASE_CHANNEL == "beta":
+                # releases/latest は stable しか指さない。beta を stable で置き換えない
+                return SETUP_DOWNLOAD_FAILED
+        return Model._downloadSetup(expected_sha256, config.setupDownloadUrl(tag))
 
     @staticmethod
     def _updateAndRestart(edition: str, target_version: Optional[str]) -> str:

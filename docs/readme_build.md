@@ -500,37 +500,33 @@ git push origin v3.5.0-beta.1
 | 項目 | 本番版 (`v3.5.0`) | β版 (`v3.5.0-beta.1`) |
 |---|---|---|
 | GitHub Release | `prerelease: false` | `prerelease: true` |
-| Hugging Face公開先 | `ms-software/VRCT` | `ms-software/VRCT-beta` |
-| インストーラー(setup.exe)の既定ダウンロード元 | `ms-software/VRCT` | `ms-software/VRCT-beta`(バージョン文字列の `-beta`/`-rc` から自動判定、または `/CHANNEL=` 指定) |
+| VRCT本体の「最新版」判定 | `releases/latest` | prerelease の中で最新のもの |
 
-> **事前準備**: β用のHugging Faceリポジトリ `ms-software/VRCT-beta` は
-> CIでは自動作成されないため、初回は手動で作成しておく必要があります。
+配布物はすべて GitHub Releases (`matty/VRCT`) のアセットです。
+
+| アセット | 内容 |
+|---|---|
+| `VRCT_setup.exe` / `.sha256` | インストーラー (アプリ内アップデーターもこの名前で取得) |
+| `VRCT.zip.001`, `.002`, ... / `VRCT.zip.parts` / `VRCT.zip.sha256` | CPU版本体。GitHub のアセットは 2 GiB 未満という制限があるため 1 GiB ごとに分割し、分割数を `.parts` に書く。`.sha256` は結合後の zip 全体のもの |
+| `VRCT_cuda.zip.001`, ... / `.parts` / `.sha256` | GPU版本体 (同上) |
 
 ### チャンネル切り替え・旧バージョンへのロールバック
 
-GitHub Releasesで配布されるsetup.exeは、実行時にHugging Faceから本体一式を
-ダウンロードするダウンローダー形式です。そのため、通常はGitHub Releasesの
-古いバージョンのsetup.exeを取得しても、その時点の最新版がインストールされてしまいます。
+GitHub Releasesで配布されるsetup.exeは、実行時に本体一式をダウンロードする
+ダウンローダー形式です。setup.exeは自分が添付されているリリース
+(`v<setup.exeのバージョン>`) の本体を入れます。分割されたパーツを順に取得して
+結合し、SHA-256を確認してから展開します。
 
-チャンネル・バージョンの指定はGUI画面ではなく `/CHANNEL=` `/VERSION=` の
-CLI引数でのみ行えます(setup.exe自体はどのバージョン・チャンネルのものでも
-構いません)。setup.exeを単体でダブルクリックした場合はこれらの引数が付かない
-ため、CPU/GPU選択のみでビルド元チャンネルの最新版がインストールされます
-(GUI上に選択肢を増やさないための意図的な設計です)。VRCT本体のUpdaterタブ
-からの更新はこれらの引数を自動的に付与して起動します。
+VRCT本体のUpdaterタブからの更新では、選択中のチャンネルの最新版 (または
+選択したバージョン) のリリースに添付された setup.exe を取得して起動します。
+別のリリースの本体を入れたい場合は `/VERSION=` で指定できます。
 
 ```bash
-VRCT_setup.exe /CHANNEL=beta
 VRCT_setup.exe /VERSION=3.4.2
 ```
 
-`/VERSION=` を指定した場合は、そのバージョン文字列に `-beta` または `-rc` が
-含まれるかどうかで自動的にダウンロード元リポジトリ(`ms-software/VRCT` /
-`ms-software/VRCT-beta`)を判定します(`/CHANNEL=` の指定より優先されます)。
-`/VERSION=` を指定しない場合は `/CHANNEL=`(省略時はこのsetup.exe自身が
-ビルドされたチャンネル)の最新版をダウンロードします。指定したバージョンが
-Hugging Face上に存在しない場合はダウンロードに失敗し、インストールが
-中断されます。
+指定したバージョンのリリースに本体のアセットが無い場合はダウンロードに
+失敗し、インストールが中断されます。
 
 ### リリースパッケージの内容
 
