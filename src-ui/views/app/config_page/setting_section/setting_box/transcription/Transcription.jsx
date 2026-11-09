@@ -41,6 +41,7 @@ const Mic_Container = () => {
             <MicPhraseTimeout_Box />
             <MicMaxWords_Box />
             <MicWordFilter_Box />
+            <MicNoiseReduction_Box />
         </div>
     );
 };
@@ -106,6 +107,21 @@ const MicMaxWords_Box = () => {
     );
 };
 
+const MicNoiseReduction_Box = () => {
+    const { t } = useI18n();
+    const { currentMicNoiseReduction, toggleMicNoiseReduction } = useTranscription();
+
+    return (
+        <SwitchBoxContainer
+            setting_id="mic_noise_reduction"
+            label={t("config_page.transcription.mic_noise_reduction.label")}
+            desc={t("config_page.transcription.mic_noise_reduction.desc")}
+            variable={currentMicNoiseReduction}
+            toggleFunction={toggleMicNoiseReduction}
+        />
+    );
+};
+
 const MicWordFilter_Box = () => {
     const { t } = useI18n();
 
@@ -128,7 +144,23 @@ const Speaker_Container = () => {
             <SpeakerRecordTimeout_Box />
             <SpeakerPhraseTimeout_Box />
             <SpeakerMaxWords_Box />
+            <SpeakerNoiseReduction_Box />
         </div>
+    );
+};
+
+const SpeakerNoiseReduction_Box = () => {
+    const { t } = useI18n();
+    const { currentSpeakerNoiseReduction, toggleSpeakerNoiseReduction } = useTranscription();
+
+    return (
+        <SwitchBoxContainer
+            setting_id="speaker_noise_reduction"
+            label={t("config_page.transcription.speaker_noise_reduction.label")}
+            desc={t("config_page.transcription.speaker_noise_reduction.desc")}
+            variable={currentSpeakerNoiseReduction}
+            toggleFunction={toggleSpeakerNoiseReduction}
+        />
     );
 };
 

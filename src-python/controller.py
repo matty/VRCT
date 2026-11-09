@@ -220,6 +220,7 @@ _SIMPLE_CONFIG_GETTERS = {
     "getMicAvgLogprob": "MIC_AVG_LOGPROB",
     "getMicNoSpeechProb": "MIC_NO_SPEECH_PROB",
     "getMicVadFilter": "MIC_ENABLE_VAD",
+    "getMicNoiseReduction": "MIC_NOISE_REDUCTION",
     "getAutoSpeakerSelect": "AUTO_SPEAKER_SELECT",
     "getSelectedSpeakerDevice": "SELECTED_SPEAKER_DEVICE",
     "getSpeakerThreshold": "SPEAKER_THRESHOLD",
@@ -231,6 +232,7 @@ _SIMPLE_CONFIG_GETTERS = {
     "getSpeakerAvgLogprob": "SPEAKER_AVG_LOGPROB",
     "getSpeakerNoSpeechProb": "SPEAKER_NO_SPEECH_PROB",
     "getSpeakerVadFilter": "SPEAKER_ENABLE_VAD",
+    "getSpeakerNoiseReduction": "SPEAKER_NOISE_REDUCTION",
     "getOscIpAddress": "OSC_IP_ADDRESS",
     "getOscPort": "OSC_PORT",
     "getNotificationVrcSfx": "NOTIFICATION_VRC_SFX",
@@ -2309,6 +2311,19 @@ class Controller:
             config.MIC_ENABLE_VAD = False
         return {"status":200, "result":config.MIC_ENABLE_VAD}
 
+    # VAD と同じく、文字起こしの開始時に AudioTranscriber に渡すので次回の開始から効く
+    @staticmethod
+    def setEnableMicNoiseReduction(*args, **kwargs) -> dict:
+        if config.MIC_NOISE_REDUCTION is False:
+            config.MIC_NOISE_REDUCTION = True
+        return {"status":200, "result":config.MIC_NOISE_REDUCTION}
+
+    @staticmethod
+    def setDisableMicNoiseReduction(*args, **kwargs) -> dict:
+        if config.MIC_NOISE_REDUCTION is True:
+            config.MIC_NOISE_REDUCTION = False
+        return {"status":200, "result":config.MIC_NOISE_REDUCTION}
+
 
     @staticmethod
     def setMicRecordTimeout(data, *args, **kwargs) -> dict:
@@ -2503,6 +2518,19 @@ class Controller:
         if config.SPEAKER_ENABLE_VAD is True:
             config.SPEAKER_ENABLE_VAD = False
         return {"status":200, "result":config.SPEAKER_ENABLE_VAD}
+
+    # VAD と同じく、文字起こしの開始時に AudioTranscriber に渡すので次回の開始から効く
+    @staticmethod
+    def setEnableSpeakerNoiseReduction(*args, **kwargs) -> dict:
+        if config.SPEAKER_NOISE_REDUCTION is False:
+            config.SPEAKER_NOISE_REDUCTION = True
+        return {"status":200, "result":config.SPEAKER_NOISE_REDUCTION}
+
+    @staticmethod
+    def setDisableSpeakerNoiseReduction(*args, **kwargs) -> dict:
+        if config.SPEAKER_NOISE_REDUCTION is True:
+            config.SPEAKER_NOISE_REDUCTION = False
+        return {"status":200, "result":config.SPEAKER_NOISE_REDUCTION}
 
 
     @staticmethod

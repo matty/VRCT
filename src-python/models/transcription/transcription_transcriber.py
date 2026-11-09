@@ -41,6 +41,7 @@ from .transcription_providers import (
     TranscriptionApiError,
 )
 from .transcription_openai_compatible import TRANSCRIPTION_API_ENGINES as _API_TRANSCRIPTION_ENGINES
+from .audio_preprocess import PreprocessSettings, preprocess_audio_data
 
 # OpenAI互換系 (base_url/model差し替え) に加えて、独自プロトコルの
 # Deepgramも「APIキー/モデルを持つクラウドエンジン」として同列に扱う箇所
@@ -123,6 +124,7 @@ class AudioTranscriber:
         api_model_languages: Optional[List[str]] = None,
         vad_segmented: bool = False,
         source_label: Optional[str] = None,
+        noise_reduction: bool = False,
     ) -> None:
         self.speaker = speaker
         self.source = source_label or ("speaker" if speaker else "mic")
@@ -135,6 +137,14 @@ class AudioTranscriber:
         # 行わず、キューから取り出した各アイテムをそのまま単独で確定・
         # 文字起こしする (詳細は transcribeAudioQueue の docstring 参照)。
         self.vad_segmented = vad_segmented
+        # 確定したクリップを ASR に渡す直前に audio_preprocess を掛ける
+        # (全エンジン共通。VAD/エネルギー閾値の判定は元の音声のまま)。
+        # ハイパス + 音量正規化は常に掛ける (評価でどの条件でも平均して
+        # 悪化しなかった)。定常ノイズのゲートは noise_reduction が True の
+        # ときだけ (強い定常ノイズでは改善、他の人の声が重なると悪化した)。
+        # 評価: docs/transcription_noise_reduction_2026-11-08.md
+        self.noise_reduction = noise_reduction
+        self.preprocess_settings = PreprocessSettings(noise_reduction=noise_reduction)
         self.transcript_data: List[Dict[str, Any]] = []
         self.transcript_changed_event = Event()
         self.last_recognition_error = False
@@ -495,6 +505,14 @@ class AudioTranscriber:
         post_silence = b"\x00" * int(bytes_per_ms * VAD_POST_PAD_MS)
         return pre_silence + data + post_silence
 
+    def _preprocessAudio(self, audio_data: AudioData) -> AudioData:
+        """整えた音声のコピーを返す。失敗しても元の音声で文字起こしを続ける。"""
+        try:
+            return preprocess_audio_data(audio_data, self.preprocess_settings)
+        except Exception:  # noqa: BLE001 - never lose an utterance to preprocessing
+            errorLogging()
+            return audio_data
+
     def _finalizeAndTranscribe(
         self,
         languages: List[str],
@@ -533,6 +551,7 @@ class AudioTranscriber:
         language_calls: List[str] = []
         try:
             audio_data = self.audio_sources["process_data_func"]()
+            audio_data = self._preprocessAudio(audio_data)
             provider = self._resolve_provider()
             if provider is None:
                 provider_error = RuntimeError("transcription provider is unavailable")

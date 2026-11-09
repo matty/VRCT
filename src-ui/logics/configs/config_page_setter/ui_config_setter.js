@@ -519,6 +519,14 @@ export const SETTINGS_ARRAY = [
         logics_template_id: "get_set",
         base_endpoint_name: "mic_word_filter",
     },
+    {
+        Category: "Transcription",
+        Base_Name: "MicNoiseReduction",
+        default_value: false,
+        ui_template_id: "toggle",
+        logics_template_id: "toggle_enable_disable",
+        base_endpoint_name: "mic_noise_reduction",
+    },
     // Speaker
     {
         Category: "Transcription",
@@ -543,6 +551,14 @@ export const SETTINGS_ARRAY = [
         ui_template_id: "slider",
         logics_template_id: "get_set",
         base_endpoint_name: "speaker_max_phrases",
+    },
+    {
+        Category: "Transcription",
+        Base_Name: "SpeakerNoiseReduction",
+        default_value: false,
+        ui_template_id: "toggle",
+        logics_template_id: "toggle_enable_disable",
+        base_endpoint_name: "speaker_noise_reduction",
     },
     // Engines
     {

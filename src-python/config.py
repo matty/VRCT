@@ -933,6 +933,14 @@ class Config:
     MIC_ENABLE_VAD = ManagedProperty('MIC_ENABLE_VAD', type_=bool)
     SPEAKER_ENABLE_VAD = ManagedProperty('SPEAKER_ENABLE_VAD', type_=bool)
 
+    # -- 文字起こし前の定常ノイズ除去 (models/transcription/audio_preprocess.py) ---
+    # ハイパス + 音量正規化はこの設定に関係なく常に掛ける。この設定は
+    # スペクトルノイズゲートだけを切り替える。強い定常ノイズ (ファン等) では
+    # 改善するが、他の人の声が重なると悪化したので既定は False (オプトイン)。
+    # 評価: docs/transcription_noise_reduction_2026-11-08.md
+    MIC_NOISE_REDUCTION = ManagedProperty('MIC_NOISE_REDUCTION', type_=bool)
+    SPEAKER_NOISE_REDUCTION = ManagedProperty('SPEAKER_NOISE_REDUCTION', type_=bool)
+
     # --- Auth and API settings ---
     # 旧 config.json との後方互換のため、不足キーは既定値（None）で補完し、余剰キーは無視する。
     AUTH_KEYS = ValidatedProperty('AUTH_KEYS',
@@ -1258,6 +1266,8 @@ class Config:
         self._SPEAKER_NO_REPEAT_NGRAM_SIZE = 0
         self._MIC_ENABLE_VAD = False
         self._SPEAKER_ENABLE_VAD = False
+        self._MIC_NOISE_REDUCTION = False
+        self._SPEAKER_NOISE_REDUCTION = False
         self._OSC_IP_ADDRESS = "127.0.0.1"
         self._OSC_PORT = 9000
         self._AUTH_KEYS = {
