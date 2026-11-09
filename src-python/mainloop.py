@@ -430,6 +430,10 @@ mapping = {
     "/set/enable/mic_noise_reduction": {"status": True, "variable":controller.setEnableMicNoiseReduction},
     "/set/disable/mic_noise_reduction": {"status": True, "variable":controller.setDisableMicNoiseReduction},
 
+    "/get/data/mic_near_voice_only": {"status": True, "variable":controller.getMicNearVoiceOnly},
+    "/set/enable/mic_near_voice_only": {"status": True, "variable":controller.setEnableMicNearVoiceOnly},
+    "/set/disable/mic_near_voice_only": {"status": True, "variable":controller.setDisableMicNearVoiceOnly},
+
 
     "/set/enable/check_mic_threshold": {"status": True, "variable":controller.setEnableCheckMicThreshold},
     "/set/disable/check_mic_threshold": {"status": True, "variable":controller.setDisableCheckMicThreshold},
@@ -473,6 +477,10 @@ mapping = {
     "/get/data/speaker_noise_reduction": {"status": True, "variable":controller.getSpeakerNoiseReduction},
     "/set/enable/speaker_noise_reduction": {"status": True, "variable":controller.setEnableSpeakerNoiseReduction},
     "/set/disable/speaker_noise_reduction": {"status": True, "variable":controller.setDisableSpeakerNoiseReduction},
+
+    "/get/data/speaker_near_voice_only": {"status": True, "variable":controller.getSpeakerNearVoiceOnly},
+    "/set/enable/speaker_near_voice_only": {"status": True, "variable":controller.setEnableSpeakerNearVoiceOnly},
+    "/set/disable/speaker_near_voice_only": {"status": True, "variable":controller.setDisableSpeakerNearVoiceOnly},
 
 
     "/set/enable/check_speaker_threshold": {"status": True, "variable":controller.setEnableCheckSpeakerThreshold},

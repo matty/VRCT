@@ -46,6 +46,9 @@ from typing import Optional
 
 import numpy as np
 
+from .near_voice_gate import NearVoiceGate
+from .resample import TARGET_RATE, resample_to_16k
+
 
 @dataclass(frozen=True)
 class PreprocessSettings:
@@ -192,26 +195,45 @@ def normalize_level(samples: np.ndarray, sample_rate: int, settings: PreprocessS
 
 
 def preprocess_float(
-    samples: np.ndarray, sample_rate: int, settings: PreprocessSettings = DEFAULT_SETTINGS
-) -> np.ndarray:
+    samples: np.ndarray,
+    sample_rate: int,
+    settings: PreprocessSettings = DEFAULT_SETTINGS,
+    near_gate: Optional[NearVoiceGate] = None,
+) -> Optional[np.ndarray]:
     """[-1, 1] のモノラル float32 に、有効な処理を掛ける。
 
     前後のデジタル無音 (完全な 0。`AudioTranscriber._padWithSilenceForVad`
     が付けるパディングなど) はそのまま残し、その間だけを処理する。
     含めると 0 がノイズフロアとみなされ、ゲートが何もしなくなる。
+
+    `near_gate` を渡すと遠くの声だけの区間を落とす (near_voice_gate 参照)。
+    クリップ全体が遠くの声だけなら None を返す。
     """
     samples = samples.astype(np.float32, copy=False)
     nonzero = np.flatnonzero(samples)
     if nonzero.size == 0:
         return samples
     start, end = int(nonzero[0]), int(nonzero[-1]) + 1
+    core = _process(samples[start:end], sample_rate, settings, near_gate)
+    if core is None:
+        return None
     out = samples.copy()
-    out[start:end] = _process(samples[start:end], sample_rate, settings)
+    out[start:end] = core
     return out
 
 
-def _process(samples: np.ndarray, sample_rate: int, settings: PreprocessSettings) -> np.ndarray:
+def _process(
+    samples: np.ndarray,
+    sample_rate: int,
+    settings: PreprocessSettings,
+    near_gate: Optional[NearVoiceGate],
+) -> Optional[np.ndarray]:
     out = spectral_filter(samples, sample_rate, settings)
+    if near_gate is not None:
+        # 正規化の前に掛ける (レベルで遠近を判定するので、元のレベルのまま見る)。
+        out = near_gate.process(out, sample_rate)
+        if out is None:
+            return None
     if settings.normalize:
         out = normalize_level(out, sample_rate, settings)
     return np.clip(out, -1.0, 1.0)
@@ -228,13 +250,29 @@ def preprocess_pcm16(
     return np.rint(out * 32767.0).astype("<i2").tobytes()
 
 
-def preprocess_audio_data(audio_data, settings: Optional[PreprocessSettings] = DEFAULT_SETTINGS):
+def preprocess_audio_data(
+    audio_data,
+    settings: Optional[PreprocessSettings] = DEFAULT_SETTINGS,
+    near_gate: Optional[NearVoiceGate] = None,
+    resample_16k: bool = False,
+):
     """speech_recognition の `AudioData` (モノラル) を整えたコピーを返す。
 
-    サンプル幅は問わない。結果は同じサンプルレートの 16bit。
+    サンプル幅は問わない。結果は 16bit。`resample_16k` なら 16 kHz に
+    折り返し無しでリサンプリングする (後段の `get_raw_data(convert_rate=16000)`
+    が `audioop.ratecv` を使わずに済む)。クリップ全体が遠くの声だけなら None。
     """
-    if settings is None:
+    if settings is None and near_gate is None and not resample_16k:
         return audio_data
     raw = audio_data.get_raw_data(convert_width=2)
-    cleaned = preprocess_pcm16(raw, audio_data.sample_rate, settings)
-    return type(audio_data)(cleaned, audio_data.sample_rate, 2)
+    samples = np.frombuffer(raw[: len(raw) - len(raw) % 2], dtype="<i2").astype(np.float32) / 32768.0
+    rate = audio_data.sample_rate
+    if resample_16k and rate > TARGET_RATE:
+        samples = resample_to_16k(samples, rate)
+        rate = TARGET_RATE
+    if samples.size and (settings is not None or near_gate is not None):
+        samples = preprocess_float(samples, rate, settings or PreprocessSettings(highpass_hz=0, normalize=False), near_gate)
+        if samples is None:
+            return None
+    cleaned = np.rint(np.clip(samples, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+    return type(audio_data)(cleaned, rate, 2)

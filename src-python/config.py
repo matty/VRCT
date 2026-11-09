@@ -940,6 +940,11 @@ class Config:
     # 評価: docs/transcription_noise_reduction_2026-11-08.md
     MIC_NOISE_REDUCTION = ManagedProperty('MIC_NOISE_REDUCTION', type_=bool)
     SPEAKER_NOISE_REDUCTION = ManagedProperty('SPEAKER_NOISE_REDUCTION', type_=bool)
+    # -- 近くの声だけを送る (models/transcription/near_voice_gate.py) ---
+    # 最も近い話者のレベルを追跡し、それより十分小さい (遠い) 声だけの区間を
+    # 落とす。遠くの声だけのクリップは文字起こし自体をしない。
+    MIC_NEAR_VOICE_ONLY = ManagedProperty('MIC_NEAR_VOICE_ONLY', type_=bool)
+    SPEAKER_NEAR_VOICE_ONLY = ManagedProperty('SPEAKER_NEAR_VOICE_ONLY', type_=bool)
 
     # --- Auth and API settings ---
     # 旧 config.json との後方互換のため、不足キーは既定値（None）で補完し、余剰キーは無視する。
@@ -1268,6 +1273,8 @@ class Config:
         self._SPEAKER_ENABLE_VAD = False
         self._MIC_NOISE_REDUCTION = False
         self._SPEAKER_NOISE_REDUCTION = False
+        self._MIC_NEAR_VOICE_ONLY = True
+        self._SPEAKER_NEAR_VOICE_ONLY = False
         self._OSC_IP_ADDRESS = "127.0.0.1"
         self._OSC_PORT = 9000
         self._AUTH_KEYS = {

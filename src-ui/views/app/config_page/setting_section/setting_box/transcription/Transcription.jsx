@@ -41,6 +41,7 @@ const Mic_Container = () => {
             <MicPhraseTimeout_Box />
             <MicMaxWords_Box />
             <MicWordFilter_Box />
+            <MicNearVoiceOnly_Box />
             <MicNoiseReduction_Box />
         </div>
     );
@@ -107,6 +108,21 @@ const MicMaxWords_Box = () => {
     );
 };
 
+const MicNearVoiceOnly_Box = () => {
+    const { t } = useI18n();
+    const { currentMicNearVoiceOnly, toggleMicNearVoiceOnly } = useTranscription();
+
+    return (
+        <SwitchBoxContainer
+            setting_id="mic_near_voice_only"
+            label={t("config_page.transcription.mic_near_voice_only.label")}
+            desc={t("config_page.transcription.mic_near_voice_only.desc")}
+            variable={currentMicNearVoiceOnly}
+            toggleFunction={toggleMicNearVoiceOnly}
+        />
+    );
+};
+
 const MicNoiseReduction_Box = () => {
     const { t } = useI18n();
     const { currentMicNoiseReduction, toggleMicNoiseReduction } = useTranscription();
@@ -144,8 +160,24 @@ const Speaker_Container = () => {
             <SpeakerRecordTimeout_Box />
             <SpeakerPhraseTimeout_Box />
             <SpeakerMaxWords_Box />
+            <SpeakerNearVoiceOnly_Box />
             <SpeakerNoiseReduction_Box />
         </div>
+    );
+};
+
+const SpeakerNearVoiceOnly_Box = () => {
+    const { t } = useI18n();
+    const { currentSpeakerNearVoiceOnly, toggleSpeakerNearVoiceOnly } = useTranscription();
+
+    return (
+        <SwitchBoxContainer
+            setting_id="speaker_near_voice_only"
+            label={t("config_page.transcription.speaker_near_voice_only.label")}
+            desc={t("config_page.transcription.speaker_near_voice_only.desc")}
+            variable={currentSpeakerNearVoiceOnly}
+            toggleFunction={toggleSpeakerNearVoiceOnly}
+        />
     );
 };
 

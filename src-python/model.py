@@ -809,6 +809,7 @@ class MicSession(_AudioDeviceSession):
             compute_type=config.SELECTED_TRANSCRIPTION_COMPUTE_TYPE,
             vad_segmented=config.MIC_ENABLE_VAD is True,
             noise_reduction=config.MIC_NOISE_REDUCTION is True,
+            near_voice_only=config.MIC_NEAR_VOICE_ONLY is True,
             source_label="mic",
             **self._resolve_api_transcription_kwargs(),
         )
@@ -872,6 +873,7 @@ class SpeakerSession(_AudioDeviceSession):
             compute_type=config.SELECTED_TRANSCRIPTION_COMPUTE_TYPE,
             vad_segmented=config.SPEAKER_ENABLE_VAD is True,
             noise_reduction=config.SPEAKER_NOISE_REDUCTION is True,
+            near_voice_only=config.SPEAKER_NEAR_VOICE_ONLY is True,
             source_label="speaker",
             **self._resolve_api_transcription_kwargs(),
         )
