@@ -23,15 +23,12 @@ partial (発話中の暫定結果) 通知は行わない。
 """
 
 import time
-from io import BytesIO
 from queue import Empty
 from threading import Event
-import wave
 from typing import Any, Dict, List, Optional
-from speech_recognition import Recognizer, AudioData, AudioFile
+from speech_recognition import Recognizer, AudioData
 from speech_recognition.exceptions import UnknownValueError
 from datetime import datetime, timedelta
-from pyaudiowpatch import get_sample_size, paInt16
 from .transcription_whisper import getWhisperModel, checkWhisperWeight
 from .transcription_providers import (
     GoogleProvider,
@@ -41,6 +38,8 @@ from .transcription_providers import (
     TranscriptionApiError,
 )
 from .transcription_openai_compatible import TRANSCRIPTION_API_ENGINES as _API_TRANSCRIPTION_ENGINES
+from .audio_preprocess import PreprocessSettings, preprocess_audio_data
+from .near_voice_gate import NearVoiceGate
 
 # OpenAI互換系 (base_url/model差し替え) に加えて、独自プロトコルの
 # Deepgramも「APIキー/モデルを持つクラウドエンジン」として同列に扱う箇所
@@ -48,7 +47,6 @@ from .transcription_openai_compatible import TRANSCRIPTION_API_ENGINES as _API_T
 _CLOUD_TRANSCRIPTION_ENGINES = _API_TRANSCRIPTION_ENGINES + ("Deepgram",)
 
 import numpy as np
-from pydub import AudioSegment
 from errors import AudioPipelineError, AudioPipelineFailure, ERROR_METADATA, ErrorCode
 from utils import errorLogging, printLog
 
@@ -123,6 +121,8 @@ class AudioTranscriber:
         api_model_languages: Optional[List[str]] = None,
         vad_segmented: bool = False,
         source_label: Optional[str] = None,
+        noise_reduction: bool = False,
+        near_voice_only: bool = False,
     ) -> None:
         self.speaker = speaker
         self.source = source_label or ("speaker" if speaker else "mic")
@@ -135,6 +135,18 @@ class AudioTranscriber:
         # 行わず、キューから取り出した各アイテムをそのまま単独で確定・
         # 文字起こしする (詳細は transcribeAudioQueue の docstring 参照)。
         self.vad_segmented = vad_segmented
+        # 確定したクリップを ASR に渡す直前に audio_preprocess を掛ける
+        # (全エンジン共通。VAD/エネルギー閾値の判定は元の音声のまま)。
+        # ハイパス + 音量正規化は常に掛ける (評価でどの条件でも平均して
+        # 悪化しなかった)。定常ノイズのゲートは noise_reduction が True の
+        # ときだけ (強い定常ノイズでは改善、他の人の声が重なると悪化した)。
+        # 評価: docs/transcription_noise_reduction_2026-11-08.md
+        self.noise_reduction = noise_reduction
+        self.preprocess_settings = PreprocessSettings(noise_reduction=noise_reduction)
+        # 近くの声だけを送る (near_voice_gate)。最も近い話者のレベルをクリップを
+        # またいで追跡するので、transcriber (= mic/speaker のセッション) ごとに 1 つ。
+        self.near_gate: Optional[NearVoiceGate] = NearVoiceGate() if near_voice_only else None
+        self.near_voice_skips = 0
         self.transcript_data: List[Dict[str, Any]] = []
         self.transcript_changed_event = Event()
         self.last_recognition_error = False
@@ -495,6 +507,26 @@ class AudioTranscriber:
         post_silence = b"\x00" * int(bytes_per_ms * VAD_POST_PAD_MS)
         return pre_silence + data + post_silence
 
+    def _preprocessAudio(self, audio_data: AudioData) -> Optional[AudioData]:
+        """整えた音声のコピーを返す。遠くの声だけのクリップなら None。
+
+        失敗しても元の音声で文字起こしを続ける。Google 以外 (Whisper・API) は
+        16 kHz で送るので、ここで折り返しの無いリサンプリングをしておく
+        (しないとプロバイダ側の get_raw_data(convert_rate=16000) が
+        ローパス無しの audioop.ratecv を使う。resample.py 参照)。Google には
+        従来どおりデバイスのレートのまま送る。
+        """
+        try:
+            return preprocess_audio_data(
+                audio_data,
+                self.preprocess_settings,
+                near_gate=self.near_gate,
+                resample_16k=self.transcription_engine != "Google",
+            )
+        except Exception:  # noqa: BLE001 - never lose an utterance to preprocessing
+            errorLogging()
+            return audio_data
+
     def _finalizeAndTranscribe(
         self,
         languages: List[str],
@@ -533,6 +565,15 @@ class AudioTranscriber:
         language_calls: List[str] = []
         try:
             audio_data = self.audio_sources["process_data_func"]()
+            audio_data = self._preprocessAudio(audio_data)
+            if audio_data is None:
+                # 遠くの声だけのクリップ。文字起こしも翻訳もしない。
+                self.near_voice_skips += 1
+                printLog(
+                    f"[near-voice][{self.source}] skipped a clip with only distant voices "
+                    f"(reference={self.near_gate.reference_db:.1f}dBFS skips={self.near_voice_skips})"
+                )
+                return True
             provider = self._resolve_provider()
             if provider is None:
                 provider_error = RuntimeError("transcription provider is unavailable")
@@ -625,37 +666,25 @@ class AudioTranscriber:
         )
         return True
 
-    def processMicData(self) -> AudioData:
+    def _monoAudioData(self) -> AudioData:
         data = self.audio_sources["last_sample"]
         channels = self.audio_sources["channels"]
         if channels > 1:
-            # マイクはデバイス本来のチャンネル数で開いているので平均してモノラルにする
-            # (VAD 経路の Pcm16MonoNormalizer と同じ。AudioFile の L+R 合計は音割れする)
+            # チャンネルを平均してモノラルにする (VAD 経路の Pcm16MonoNormalizer と同じ)。
+            # speech_recognition の AudioFile は L+R を合計する (audioop.tomono(…, 1, 1)) ので
+            # 大きい音が音割れする
             samples = np.frombuffer(data, dtype="<i2")
             frames = samples[: samples.size - samples.size % channels].reshape(-1, channels)
             data = np.rint(frames.mean(axis=1)).astype("<i2").tobytes()
-        audio_data = AudioData(data, self.audio_sources["sample_rate"], self.audio_sources["sample_width"])
-        return audio_data
+        return AudioData(data, self.audio_sources["sample_rate"], self.audio_sources["sample_width"])
+
+    def processMicData(self) -> AudioData:
+        return self._monoAudioData()
 
     def processSpeakerData(self) -> AudioData:
-        temp_file = BytesIO()
-        with wave.open(temp_file, 'wb') as wf:
-            wf.setnchannels(self.audio_sources["channels"])
-            wf.setsampwidth(get_sample_size(paInt16))
-            wf.setframerate(self.audio_sources["sample_rate"])
-            wf.writeframes(self.audio_sources["last_sample"])
-        temp_file.seek(0)
-
-        if self.audio_sources["channels"] > 2:
-            audio = AudioSegment.from_file(temp_file, format="wav")
-            mono_audio = audio.set_channels(1)
-            temp_file = BytesIO()
-            mono_audio.export(temp_file, format="wav")
-            temp_file.seek(0)
-
-        with AudioFile(temp_file) as source:
-            audio = self.audio_recognizer.record(source)
-        return audio
+        # 以前は WAV に書いて AudioFile で読み直しており、ステレオ (ループバックの既定) は
+        # L+R の合計になっていた。ゲーム音声が -6 dBFS を超えると音割れする。
+        return self._monoAudioData()
 
     def updateTranscript(self, result: dict) -> None:
         """呼び出し元 (_finalizeAndTranscribe) は完成したフレーズ1件に

@@ -67,6 +67,19 @@ class TestAudioProcessingSelection(unittest.TestCase):
 
         self.assertEqual(result.get_raw_data(), np.array([500, -1000], dtype="<i2").tobytes())
 
+    @patch("models.transcription.transcription_transcriber.checkWhisperWeight", return_value=False)
+    def test_downmixes_loud_stereo_speaker_pcm_without_clipping(self, _) -> None:
+        source = FakeAudioSource()
+        source.channels = 2
+        transcriber = AudioTranscriber(True, source, 3, 10, "Google")
+        # ゲーム音声が大きいとき (L=R=-1.3 dBFS)。L+R の合計だと 32767 に張り付く
+        transcriber.audio_sources["last_sample"] = np.array([28000, 28000, -28000, -28000], dtype="<i2").tobytes()
+
+        result = transcriber.processSpeakerData()
+
+        self.assertEqual(result.get_raw_data(), np.array([28000, -28000], dtype="<i2").tobytes())
+        self.assertEqual(result.sample_rate, 16000)
+
 
 class TestGoogleRecognizerTimeout(unittest.TestCase):
     """Issue #63: Google recognition must not block indefinitely on a bad network."""

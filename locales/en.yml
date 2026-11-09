@@ -267,6 +267,12 @@ config_page:
         mic_vad_filter:
             label: "Mic VAD Filter"
             desc: "Only send audio to recognition after a silence gap is detected. Disable this if mic transcription stops mid-conversation instead of continuing to transcribe."
+        mic_near_voice_only:
+            label: "Mic: Near Voice Only"
+            desc: "Only transcribe your own (closest) voice. Quieter voices from farther away, such as people in the room or game audio leaking into the mic, are cut out, and clips that contain only them are not transcribed or translated. Words spoken at the same moment as you cannot be separated. Takes effect the next time transcription starts."
+        mic_noise_reduction:
+            label: "Mic Noise Reduction"
+            desc: "Reduces steady background noise in your voice (PC fans, air conditioning, mic hiss) before transcription. Helps when that noise is loud, but can lower accuracy when other people are talking in the background, so it is off by default. Low rumble/hum removal and volume leveling are always applied. Takes effect the next time transcription starts."
         speaker_record_timeout:
             label: "Speaker Record Timeout"
             desc: "Detects silence and, when the specified number of seconds has passed, considers the speaker input to have ended. (Second(s))"
@@ -279,6 +285,12 @@ config_page:
         speaker_vad_filter:
             label: "Speaker VAD Filter"
             desc: "Only send audio to recognition after a silence gap is detected. Disable this if speaker transcription stops or shows 'speech recognition request failed' during continuous game/voice audio."
+        speaker_near_voice_only:
+            label: "Speaker: Near Voice Only"
+            desc: "Only transcribe the nearest players. VRChat makes farther players quieter, so voices much quieter than the nearest speaker are cut out and clips with only them are not transcribed or translated. A nearby player with a very quiet mic may be cut as well. Takes effect the next time transcription starts."
+        speaker_noise_reduction:
+            label: "Speaker Noise Reduction"
+            desc: "Reduces steady background noise in other players' voices (fans, air conditioning, mic hiss) before transcription. Helps when that noise is loud, but can lower accuracy when several people talk at once, so it is off by default. Low rumble/hum removal and volume leveling are always applied. Takes effect the next time transcription starts."
         select_transcription_engine:
             label: "Transcription Engine Used For Speech Recognition"
         whisper_weight_type:

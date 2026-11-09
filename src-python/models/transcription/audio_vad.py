@@ -48,6 +48,8 @@ from typing import Callable, Deque, Literal, Optional, Protocol
 
 import numpy as np
 
+from .resample import AntiAliasFilter
+
 TARGET_SAMPLE_RATE = 16000
 FRAME_SAMPLES = 512
 FRAME_DURATION_MS = FRAME_SAMPLES / TARGET_SAMPLE_RATE * 1000  # 32.0 ms
@@ -67,9 +69,13 @@ class Pcm16MonoNormalizer:
         self.sample_width = sample_width
         self.channels = max(1, channels)
         self._rate_state = None
+        # audioop.ratecv はローパス無しで間引くので、8 kHz より上の成分が音声帯域に
+        # 折り返す (48 kHz → 16 kHz で 15 kHz のサー音が 1 kHz に出る)。先に落としておく。
+        self._anti_alias = AntiAliasFilter(sample_rate)
 
     def reset(self) -> None:
         self._rate_state = None
+        self._anti_alias.reset()
 
     def process(self, data: bytes) -> bytes:
         if not data:
@@ -87,6 +93,7 @@ class Pcm16MonoNormalizer:
         data = samples.astype("<i2", copy=False).tobytes()
 
         if self.sample_rate != TARGET_SAMPLE_RATE:
+            data = self._anti_alias.process(data)
             data, self._rate_state = audioop.ratecv(
                 data,
                 2,
