@@ -1402,28 +1402,43 @@ class Model:
 
         return compatible_engines
 
-    def addTranslationHistory(self, source: str, text: str) -> None:
+    def addTranslationHistory(self, source: str, text: str, phrase_id: Optional[int] = None) -> None:
         """Add a message to translation context history.
-        
+
         Args:
             source: "chat" | "mic" | "speaker" | "ocr"
             text: message content
+            phrase_id: 同じ発話から出た文字起こし結果に共通の番号 (mic/speaker のみ)。
+                文字起こしは発話が続いている間、育っていく同じ発話を何度も結果として
+                出す ("Hello" → "Hello my name is" → "Hello my name is Matty")。
+                これを 1 件ずつ積むと、翻訳の文脈 (LLM・DeepL とも直近 5 件) が同じ
+                発話の途中経過で埋まり、相手の発言が押し出される。同じ番号の項目が
+                既にあれば、追加せずにその本文を置き換える。
         """
         self.ensure_initialized()
         if not text or not text.strip():
             return
-        
+
+        if phrase_id is not None:
+            for item in reversed(self.translation_history):
+                if item.get("source") == source and item.get("phrase_id") == phrase_id:
+                    # 位置 (発話が始まった順) と時刻はそのまま、本文だけ最新にする。
+                    item["text"] = text.strip()
+                    return
+
         history_item = {
             "source": source,
             "text": text.strip(),
             "timestamp": datetime.now().isoformat(),
         }
+        if phrase_id is not None:
+            history_item["phrase_id"] = phrase_id
         self.translation_history.append(history_item)
-        
+
         # 最大件数を超えた場合は古いものを削除
         if len(self.translation_history) > self.translation_history_max_items:
             self.translation_history = self.translation_history[-self.translation_history_max_items:]
-    
+
     def getTranslationHistory(self, max_items: int = None) -> list[dict]:
         """Get recent translation context history.
         

@@ -300,6 +300,15 @@ class TestMicMessage(_MessagePipelineTestBase):
         # メッセージが先、翻訳が後になる。
         self._model.oscSendMessage.assert_called_once_with("hello\nhola")
 
+    def test_mic_passes_the_phrase_id_to_the_translation_history(self) -> None:
+        # 同じ発話の途中経過 (interim_send) を、翻訳の文脈に 1 件ずつ積まないため。
+        self.controller.micMessage({"text": "hello", "language": "English", "phrase_id": 12})
+        self._model.addTranslationHistory.assert_called_once_with("mic", "hello", phrase_id=12)
+
+    def test_speaker_passes_the_phrase_id_to_the_translation_history(self) -> None:
+        self.controller.speakerMessage({"text": "hello", "language": "English", "phrase_id": 13})
+        self._model.addTranslationHistory.assert_called_once_with("speaker", "hello", phrase_id=13)
+
     def test_osc_message_over_the_vrchat_limit_is_sent_as_pages(self) -> None:
         # VRChat は144文字で切り捨てる。既定の書式では原文が先なので、切れるのは
         # 訳文の後半になる。分割して全部届ける。

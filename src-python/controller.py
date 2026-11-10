@@ -977,6 +977,7 @@ class Controller:
         language: Optional[str],
         msg_id: Optional[str] = None,
         asr_ms: Optional[int] = None,
+        phrase_id: Optional[int] = None,
     ) -> Optional[dict]:
         """mic/speaker/chatMessage共通のパイプライン(バックエンドレビュー
         フェーズ3項目25、`MessageDirectionSpec`参照)。
@@ -1224,7 +1225,11 @@ class Controller:
                 translation_text = f" ({'/'.join(translation)})" if translation else ""
                 model.logger.info(f"{spec.logger_prefix} {message}{translation_text}")
 
-        model.addTranslationHistory(spec.kind, message)
+        if phrase_id is None:
+            model.addTranslationHistory(spec.kind, message)
+        else:
+            # 同じ発話の途中経過は、文脈に積まずに置き換える。
+            model.addTranslationHistory(spec.kind, message, phrase_id=phrase_id)
 
         pipeline_elapsed_ms = round((time.perf_counter() - pipeline_started_at) * 1000)
         # asr= は mic/speaker のみ (chat には ASR 段が無い)。
@@ -1291,7 +1296,10 @@ class Controller:
                 },
             )
         elif isinstance(message, str) and len(message) > 0:
-            self._processMessage(MIC_MESSAGE_SPEC, message, language, asr_ms=result.get("asr_ms"))
+            self._processMessage(
+                MIC_MESSAGE_SPEC, message, language,
+                asr_ms=result.get("asr_ms"), phrase_id=result.get("phrase_id"),
+            )
 
     def speakerMessage(self, result:dict) -> None:
         if result.get("recognition_error") is True:
@@ -1331,7 +1339,10 @@ class Controller:
                 },
             )
         elif isinstance(message, str) and len(message) > 0:
-            self._processMessage(SPEAKER_MESSAGE_SPEC, message, language, asr_ms=result.get("asr_ms"))
+            self._processMessage(
+                SPEAKER_MESSAGE_SPEC, message, language,
+                asr_ms=result.get("asr_ms"), phrase_id=result.get("phrase_id"),
+            )
 
     def ocrMessage(self, result: dict) -> None:
         """OCRで読んだチャット吹き出しを、受信メッセージと同じ経路へ流す。

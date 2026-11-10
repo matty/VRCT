@@ -22,6 +22,7 @@ partial (発話中の暫定結果) 通知は行わない。
 生じていた。詳細は transcribeAudioQueue の docstring 参照。
 """
 
+import itertools
 import time
 from queue import Empty
 from threading import Event
@@ -77,6 +78,14 @@ MAX_PHRASE_DURATION_SECONDS = 15
 # 変わらない挙動のままで問題が確認されていないため)。
 VAD_PRE_PAD_MS = 300
 VAD_POST_PAD_MS = 500
+
+
+# 発話 (蓄積バッファ) ごとの通し番号。interim_send は同じ発話の「育っていく
+# バッファ」を何度も文字起こしするので、1 つの発話から結果が複数出る。同じ発話の
+# 結果には同じ番号を付け、受け取る側が「前の結果の続き」だと分かるようにする
+# (翻訳の文脈に同じ発話を何件も積まないため。model.addTranslationHistory)。
+# mic/speaker やセッションをまたいで重ならないよう、プロセスで 1 つの連番にする。
+_PHRASE_IDS = itertools.count(1)
 
 
 def _bufferedSeconds(source_info: Dict[str, Any]) -> float:
@@ -147,6 +156,7 @@ class AudioTranscriber:
         # またいで追跡するので、transcriber (= mic/speaker のセッション) ごとに 1 つ。
         self.near_gate: Optional[NearVoiceGate] = NearVoiceGate() if near_voice_only else None
         self.near_voice_skips = 0
+        self._phrase_id = next(_PHRASE_IDS)
         self.transcript_data: List[Dict[str, Any]] = []
         self.transcript_changed_event = Event()
         self.last_recognition_error = False
@@ -325,6 +335,7 @@ class AudioTranscriber:
                 transcribed = True
             source_info["last_sample"] = bytes()
             source_info["phrase_started_at"] = None
+            self._phrase_id = next(_PHRASE_IDS)
             unsent = False
 
         def interim_send() -> None:
@@ -343,6 +354,7 @@ class AudioTranscriber:
             nonlocal unsent
             source_info["last_sample"] = bytes()
             source_info["phrase_started_at"] = None
+            self._phrase_id = next(_PHRASE_IDS)
             unsent = False
 
         if self.vad_segmented:
@@ -685,6 +697,7 @@ class AudioTranscriber:
             self.last_recognition_error = False
             self.asr_successes += 1
             best["asr_ms"] = asr_elapsed_ms
+            best["phrase_id"] = self._phrase_id
             self.updateTranscript(best)
         success_rate = (self.asr_successes / self.asr_attempts) * 100
         printLog(
@@ -751,3 +764,4 @@ class AudioTranscriber:
         self.audio_sources["last_sample"] = bytes()
         self.audio_sources["last_spoken"] = None
         self.audio_sources["phrase_started_at"] = None
+        self._phrase_id = next(_PHRASE_IDS)
