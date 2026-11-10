@@ -59,12 +59,12 @@ export const useMessage = () => {
 
     const addSentMessageLog = (payload) => {
         const message_object = generateMessageObject(payload, "sent");
-        updateMessageLogs((current) => [...current.data, message_object]);
+        updateMessageLogs(upsertMessageObject(message_object));
     };
 
     const addReceivedMessageLog = (payload) => {
         const message_object = generateMessageObject(payload, "received");
-        updateMessageLogs((current) => [...current.data, message_object]);
+        updateMessageLogs(upsertMessageObject(message_object));
     };
 
     const startTyping = () => {
@@ -115,6 +115,17 @@ const generateMessageObject = (data, category, status = "ok") => {
             translations: data.translations ?? [],
         },
     };
+};
+
+// Transcription keeps sending longer versions of the utterance that is still
+// being spoken, all with the same id. Replace the entry in place (keeping its
+// position and time) instead of adding a new one for every version.
+const upsertMessageObject = (message_object) => (current_items) => {
+    const index = current_items.data.findIndex((item) => item.id === message_object.id);
+    if (index === -1) return [...current_items.data, message_object];
+    const next = [...current_items.data];
+    next[index] = { ...message_object, created_at: next[index].created_at };
+    return next;
 };
 
 const updateItemById = (id, updated_data) => (current_items) => {

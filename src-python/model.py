@@ -29,6 +29,7 @@ from config import config, DEFAULT_OVERLAY_VR_LAUNCHER_SETTINGS
 
 from models.translation.translation_translator import Translator
 from models.osc.osc import OSCHandler
+from models.osc.chatbox_player import readingUnits
 from models.transcription.transcription_recorder import (
     SelectedMicEnergyAndAudioRecorder,
     SelectedSpeakerEnergyAndAudioRecorder,
@@ -50,6 +51,7 @@ from models.transcription.transcription_deepgram import (
 from models.transliteration.transliteration_transliterator import Transliterator
 from models.overlay.overlay import LAUNCHER, PANEL, POPUP, Overlay, launcherNearestInReach, launcherOutOfReach
 from models.overlay.overlay_image import OverlayImage
+from models.overlay.overlay_notifications import NotificationQueue
 from models.watchdog.watchdog import Watchdog
 from models.websocket.websocket_server import WebSocketServer
 from models.obs.obs_browser_source_server import ObsBrowserSourceServer
@@ -1011,6 +1013,13 @@ class Model:
         self.overlay = Overlay(overlay_settings)
         self.overlay.launcher_defaults = dict(DEFAULT_OVERLAY_VR_LAUNCHER_SETTINGS)
         self.overlay_image = OverlayImage(config.PATH_LOCAL)
+        # 受信メッセージの小さいオーバーレイ (通知) を、置き換えずに順番に見せる。
+        self.overlay_small_log_queue = NotificationQueue(
+            show=lambda img: self.overlay.updateImage(img, "small"),
+            max_dwell=lambda: self.overlay.settings["small"]["display_duration"],
+        )
+        # 発話が終わるまで書き出しを待っているログの行 (logMessage 参照)。
+        self._pending_log_lines: dict = {}
         self.mic_mute_status = None
         # OSC ミュート同期 (changeHandlerMute) が実行する pause()/resume() を
         # Controller.mic_lifecycle_lock 配下で行うためのフック。
@@ -1272,8 +1281,54 @@ class Model:
 
     def stopLogger(self):
         self.ensure_initialized()
+        self.flushLogMessages()
         self.logger.disabled = True
         self.logger = None
+
+    def logMessage(self, line: str, key=None, final: bool = True) -> None:
+        """会話ログ (ファイル) に 1 行書く。
+
+        文字起こしは、話している間、同じ発話の「ここまでの全文」を何度も出す。
+        そのたびに書くと、ログは同じ発話の途中経過だらけになる。key (発話ごとの
+        キー) が付いていて final でない行は書かずに覚えておき、その発話の最後の
+        結果 (final) か発話の終わりの知らせ (logUtteranceEnd) が来たときに、
+        最新の 1 行だけを書く。key が無い行 (チャット入力・OCR) はすぐに書く。
+        """
+        if key is None:
+            self._writeLogLine(line)
+            return
+        pending = getattr(self, "_pending_log_lines", None)
+        if pending is None:
+            pending = self._pending_log_lines = {}
+        if final:
+            pending.pop(key, None)
+            self._writeLogLine(line)
+        else:
+            pending[key] = line
+
+    def logUtteranceEnd(self, key) -> None:
+        """発話が終わった。覚えていた行があれば書く。"""
+        pending = getattr(self, "_pending_log_lines", None)
+        if not pending:
+            return
+        line = pending.pop(key, None)
+        if line is not None:
+            self._writeLogLine(line)
+
+    def flushLogMessages(self) -> None:
+        """覚えている行を全て書く (文字起こしの停止・ログの停止・終了時)。"""
+        pending = getattr(self, "_pending_log_lines", None)
+        if not pending:
+            return
+        lines = list(pending.values())
+        pending.clear()
+        for line in lines:
+            self._writeLogLine(line)
+
+    def _writeLogLine(self, line: str) -> None:
+        logger = getattr(self, "logger", None)
+        if logger is not None:
+            logger.info(line)
 
     def getListLanguageAndCountry(self):
         """List every language any translation engine supports for the UI.
@@ -2382,11 +2437,21 @@ class Model:
 
     def clearOverlayImageSmallLog(self):
         self.ensure_initialized()
+        self.overlay_small_log_queue.clear()
         self.overlay.clearImage("small")
 
     def updateOverlaySmallLog(self, img):
         self.ensure_initialized()
         self.overlay.updateImage(img, "small")
+
+    def queueOverlaySmallLog(self, img, key=None, text: str = "") -> None:
+        """小さいオーバーレイに、前の通知が読める時間だけ表示されてから出す。
+
+        key: 同じ発話の結果に共通のキー。表示中・待機中の同じ発話は置き換える。
+        text: 読む人が読む文 (表示時間を文字数から決める)。
+        """
+        self.ensure_initialized()
+        self.overlay_small_log_queue.submit(img, key=key, units=readingUnits(text))
 
     def updateOverlaySmallLogSettings(self):
         self.ensure_initialized()
@@ -2419,13 +2484,15 @@ class Model:
         if (self.overlay.settings[size]["ui_scaling"] != config.OVERLAY_SMALL_LOG_SETTINGS["ui_scaling"]):
             self.overlay.updateUiScaling(config.OVERLAY_SMALL_LOG_SETTINGS["ui_scaling"], size)
 
-    def createOverlayImageLargeLog(self, message_type:str, message:Optional[str], your_language:Optional[str],  translation:list, target_language:Optional[dict]=None, transliteration_message:Optional[list]=None, transliteration_translation:Optional[list]=None) -> object:
+    def createOverlayImageLargeLog(self, message_type:str, message:Optional[str], your_language:Optional[str],  translation:list, target_language:Optional[dict]=None, transliteration_message:Optional[list]=None, transliteration_translation:Optional[list]=None, entry_id=None) -> object:
+        """entry_id: 同じ発話の結果に共通のキー。ログに同じキーの行があれば、
+        行を増やさずにその行を置き換える。"""
         self.ensure_initialized()
         # normalize target_language dict -> list of language strings
         target_language_list = []
         if isinstance(target_language, dict):
             target_language_list = [data["language"] for data in target_language.values() if data.get("enable") is True]
-        return self.overlay_image.createOverlayImageLargeLog(message_type, message, your_language, translation, target_language_list, transliteration_message, transliteration_translation)
+        return self.overlay_image.createOverlayImageLargeLog(message_type, message, your_language, translation, target_language_list, transliteration_message, transliteration_translation, entry_id=entry_id)
 
     def createOverlayImageLargeMessage(self, message):
         self.ensure_initialized()

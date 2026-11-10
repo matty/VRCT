@@ -124,6 +124,9 @@ class _MessagePipelineTestBase(unittest.TestCase):
             ("createOverlayImageSmallLog", MagicMock(return_value="SMALL_IMG")),
             ("updateOverlayLargeLog", MagicMock()),
             ("updateOverlaySmallLog", MagicMock()),
+            ("queueOverlaySmallLog", MagicMock()),
+            ("logMessage", MagicMock()),
+            ("logUtteranceEnd", MagicMock()),
             ("setCopyToClipboardAndPasteFromClipboard", MagicMock()),
             ("checkWebSocketServerAlive", MagicMock(return_value=False)),
             ("websocketSendMessage", MagicMock()),
@@ -316,6 +319,102 @@ class TestMicMessage(_MessagePipelineTestBase):
     def test_speaker_passes_the_phrase_id_to_the_translation_history(self) -> None:
         self.controller.speakerMessage({"text": "hello", "language": "English", "phrase_id": 13})
         self._model.addTranslationHistory.assert_called_once_with("speaker", "hello", phrase_id=13)
+
+    # --- 発話ごとに 1 件: 同じ発話の途中経過は、増やさずに置き換える ---
+
+    def test_ui_payload_carries_the_same_id_for_the_same_utterance(self) -> None:
+        self.controller.micMessage({"text": "hello", "language": "English", "phrase_id": 7, "final": False})
+        self.controller.micMessage({"text": "hello there", "language": "English", "phrase_id": 7, "final": True})
+        self.controller.micMessage({"text": "bye", "language": "English", "phrase_id": 8, "final": True})
+        ids = [result["id"] for _, endpoint, result in self.run_calls if endpoint.endswith("send_mic_message")]
+        self.assertEqual(ids, ["transcription-mic-7", "transcription-mic-7", "transcription-mic-8"])
+
+    def test_ui_payload_has_no_id_without_a_phrase_id(self) -> None:
+        self.controller.micMessage({"text": "hello", "language": "English"})
+        (payload,) = [result for _, endpoint, result in self.run_calls if endpoint.endswith("send_mic_message")]
+        self.assertNotIn("id", payload)
+
+    def test_speaker_notification_is_queued_with_the_utterance_key(self) -> None:
+        config.OVERLAY_SMALL_LOG = True
+        self.controller._is_overlay_available = lambda: True
+        self._model.getOutputTranslate.return_value = (["こんにちは"], [True])
+        self.controller.speakerMessage({"text": "hello", "language": "English", "phrase_id": 3, "final": False})
+        self._model.updateOverlaySmallLog.assert_not_called()
+        self._model.queueOverlaySmallLog.assert_called_once_with("SMALL_IMG", key=("speaker", 3), text="こんにちは")
+
+    def test_speaker_notification_reading_time_falls_back_to_the_original(self) -> None:
+        config.OVERLAY_SMALL_LOG = True
+        config.ENABLE_TRANSLATION = False
+        self.controller._is_overlay_available = lambda: True
+        self.controller.speakerMessage({"text": "hello", "language": "English", "phrase_id": 3})
+        self.assertEqual(self._model.queueOverlaySmallLog.call_args.kwargs["text"], "hello")
+
+    def test_large_overlay_log_gets_the_utterance_key(self) -> None:
+        config.OVERLAY_LARGE_LOG = True
+        self.controller._is_overlay_available = lambda: True
+        self.controller.micMessage({"text": "hello", "language": "English", "phrase_id": 7})
+        self.assertEqual(self._model.createOverlayImageLargeLog.call_args.kwargs, {"entry_id": ("mic", 7)})
+
+    def test_large_overlay_log_without_a_phrase_id_is_appended_as_before(self) -> None:
+        config.OVERLAY_LARGE_LOG = True
+        self.controller._is_overlay_available = lambda: True
+        self.controller.micMessage({"text": "hello", "language": "English"})
+        self.assertEqual(self._model.createOverlayImageLargeLog.call_args.kwargs, {})
+
+    def test_log_file_line_waits_for_the_end_of_the_utterance(self) -> None:
+        config.LOGGER_FEATURE = True
+        self._model.getInputTranslate.return_value = (["hola"], [True])
+        self.controller.micMessage({"text": "hello", "language": "English", "phrase_id": 7, "final": False})
+        self._model.logger.info.assert_not_called()
+        self._model.logMessage.assert_called_once_with("[SENT] hello (hola)", key=("mic", 7), final=False)
+        self._model.logUtteranceEnd.assert_not_called()
+
+    def test_log_file_line_is_written_with_the_final_result(self) -> None:
+        config.LOGGER_FEATURE = True
+        self._model.getInputTranslate.return_value = (["hola"], [True])
+        self.controller.micMessage({"text": "hello", "language": "English", "phrase_id": 7, "final": True})
+        self._model.logMessage.assert_called_once_with("[SENT] hello (hola)", key=("mic", 7), final=True)
+        self._model.logUtteranceEnd.assert_called_once_with(("mic", 7))
+
+    def test_end_of_utterance_marker_writes_the_waiting_line(self) -> None:
+        self.controller.micMessage({"text": "", "language": None, "phrase_id": 7, "final": True})
+        self._model.logUtteranceEnd.assert_called_once_with(("mic", 7))
+        self.assertEqual(self.run_calls, [])
+        self._model.oscPlayMessage.assert_not_called()
+
+    def test_end_of_utterance_marker_is_handled_while_the_mic_is_muted(self) -> None:
+        config.VRC_MIC_MUTE_SYNC = True
+        self._model.mic_mute_status = True
+        try:
+            self.controller.micMessage({"text": "", "language": None, "phrase_id": 7, "final": True})
+        finally:
+            self._model.mic_mute_status = None
+        self._model.logUtteranceEnd.assert_called_once_with(("mic", 7))
+
+    def test_final_result_dropped_as_a_repeat_still_ends_the_utterance(self) -> None:
+        # 最後の結果が直前の途中経過と同じ文だと、繰り返し検出で捨てられる。
+        # それでも書き出し待ちの行は書かれること。
+        self._model.detectRepeatSendMessage.return_value = True
+        self.controller.micMessage({"text": "hello", "language": "English", "phrase_id": 7, "final": True})
+        self._model.logUtteranceEnd.assert_called_once_with(("mic", 7))
+
+    def test_speaker_end_of_utterance_marker(self) -> None:
+        self.controller.speakerMessage({"text": "", "language": None, "phrase_id": 4, "final": True})
+        self._model.logUtteranceEnd.assert_called_once_with(("speaker", 4))
+        self.assertEqual(self.run_calls, [])
+
+    def test_log_file_line_without_a_phrase_id_is_written_at_once(self) -> None:
+        config.LOGGER_FEATURE = True
+        self._model.getInputTranslate.return_value = (["hola"], [True])
+        self.controller.micMessage({"text": "hello", "language": "English"})
+        self._model.logger.info.assert_called_once_with("[SENT] hello (hola)")
+        self._model.logMessage.assert_not_called()
+
+    def test_websocket_message_says_which_utterance_and_whether_it_is_final(self) -> None:
+        self._model.checkWebSocketServerAlive.return_value = True
+        self.controller.micMessage({"text": "hello", "language": "English", "phrase_id": 7, "final": False})
+        sent = self._model.websocketSendMessage.call_args.args[0]
+        self.assertEqual((sent["id"], sent["final"]), ("transcription-mic-7", False))
 
     def test_osc_message_is_handed_to_the_chatbox_player_unformatted(self) -> None:
         # 分割・順番待ち・表示時間は再生キュー側の仕事。原文と訳文を別々に渡し、

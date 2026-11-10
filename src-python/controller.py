@@ -977,6 +977,7 @@ class Controller:
         msg_id: Optional[str] = None,
         asr_ms: Optional[int] = None,
         phrase_id: Optional[int] = None,
+        final: bool = True,
     ) -> Optional[dict]:
         """mic/speaker/chatMessage共通のパイプライン(バックエンドレビュー
         フェーズ3項目25、`MessageDirectionSpec`参照)。
@@ -1137,6 +1138,10 @@ class Controller:
         # 呼び出し元が持っていれば載せる。
         if spec.payload_source is not None:
             payload["source"] = spec.payload_source
+        if msg_id is None and stream_key is not None:
+            # 同じ発話の結果には同じ id を振る。UI のログは同じ id の項目を
+            # 置き換えるので、発話が育つたびに項目が増えることがない。
+            msg_id = f"transcription-{spec.kind}-{phrase_id}"
         if msg_id is not None:
             payload = {"id": msg_id, **payload}
 
@@ -1152,6 +1157,7 @@ class Controller:
                 self._sendChatboxMessage(spec.osc_format_type, osc_translation, osc_original, key=stream_key)
 
             if spec.overlay_small_log and config.OVERLAY_SMALL_LOG is True and self._is_overlay_available():
+                overlay_image = None
                 if config.OVERLAY_SHOW_ONLY_TRANSLATED_MESSAGES is True:
                     if len(translation) > 0:
                         overlay_image = model.createOverlayImageSmallLog(
@@ -1162,7 +1168,6 @@ class Controller:
                             transliteration_message,
                             transliteration_translation
                         )
-                        model.updateOverlaySmallLog(overlay_image)
                 else:
                     overlay_image = model.createOverlayImageSmallLog(
                         message,
@@ -1172,7 +1177,18 @@ class Controller:
                         transliteration_message,
                         transliteration_translation
                     )
-                    model.updateOverlaySmallLog(overlay_image)
+                if overlay_image is not None:
+                    if stream_key is None:
+                        model.updateOverlaySmallLog(overlay_image)
+                    else:
+                        # 前の通知を読める時間だけ表示してから出す。同じ発話の
+                        # 続きは、表示中の通知をその場で更新する。読むのは訳文
+                        # (無ければ原文) なので、表示時間はその長さで決める。
+                        model.queueOverlaySmallLog(
+                            overlay_image,
+                            key=stream_key,
+                            text=translation[0] if len(translation) > 0 else message,
+                        )
 
             if config.OVERLAY_LARGE_LOG is True and self._is_overlay_available():
                 if spec.overlay_direction == "send":
@@ -1181,6 +1197,8 @@ class Controller:
                 else:
                     overlay_own_language = language
                     overlay_language_list = config.SELECTED_YOUR_LANGUAGES[config.SELECTED_TAB_NO]
+                # 同じ発話の結果は、ログの行を増やさずに同じ行を置き換える。
+                large_log_kwargs = {} if stream_key is None else {"entry_id": stream_key}
                 if config.OVERLAY_SHOW_ONLY_TRANSLATED_MESSAGES is True:
                     if len(translation) > 0:
                         overlay_image = model.createOverlayImageLargeLog(
@@ -1190,7 +1208,8 @@ class Controller:
                             translation,
                             overlay_language_list,
                             transliteration_message,
-                            transliteration_translation
+                            transliteration_translation,
+                            **large_log_kwargs,
                         )
                         model.updateOverlayLargeLog(overlay_image)
                 else:
@@ -1201,7 +1220,8 @@ class Controller:
                         translation,
                         overlay_language_list,
                         transliteration_message,
-                        transliteration_translation
+                        transliteration_translation,
+                        **large_log_kwargs,
                     )
                     model.updateOverlayLargeLog(overlay_image)
 
@@ -1220,13 +1240,22 @@ class Controller:
                         "dst_languages": getattr(config, spec.ws_dst_languages_attr)[config.SELECTED_TAB_NO],
                         "message": message,
                         "translation": translation,
-                        "transliteration": transliteration_translation
+                        "transliteration": transliteration_translation,
+                        # 同じ発話の結果は同じ id。final が False の間は、同じ id で
+                        # より長い版が続く (受け取る側は置き換えればよい)。
+                        "id": msg_id,
+                        "final": final,
                     }
                 )
 
             if config.LOGGER_FEATURE is True:
                 translation_text = f" ({'/'.join(translation)})" if translation else ""
-                model.logger.info(f"{spec.logger_prefix} {message}{translation_text}")
+                log_line = f"{spec.logger_prefix} {message}{translation_text}"
+                if stream_key is None:
+                    model.logger.info(log_line)
+                else:
+                    # 発話が終わるまで待って、最後の 1 行だけを書く。
+                    model.logMessage(log_line, key=stream_key, final=final)
 
         if phrase_id is None:
             model.addTranslationHistory(spec.kind, message)
@@ -1252,7 +1281,23 @@ class Controller:
             return {"id": msg_id, **payload}
         return None
 
+    def _endUtterance(self, kind: str, result: dict) -> None:
+        """発話の最後の結果 (final) を処理した後に呼ぶ。
+
+        途中経過のまま終わった発話には、文字起こし側が本文の無い final の結果を
+        送ってくる。ログは発話ごとに最後の 1 行だけを書くので、ここで書き出す
+        (最後の結果がワードフィルタや繰り返し検出で捨てられた場合も含む)。
+        """
+        phrase_id = result.get("phrase_id")
+        if result.get("final") is True and phrase_id is not None:
+            model.logUtteranceEnd((kind, phrase_id))
+
     def micMessage(self, result: dict) -> None:
+        if result.get("text") == "" and result.get("final") is True:
+            # 発話の終わりの知らせ。ミュート中でも、書き出し待ちの行は書く。
+            self._endUtterance("mic", result)
+            return
+
         if (
             result.get("recognition_error") is not True
             and config.VRC_MIC_MUTE_SYNC is True
@@ -1302,9 +1347,15 @@ class Controller:
             self._processMessage(
                 MIC_MESSAGE_SPEC, message, language,
                 asr_ms=result.get("asr_ms"), phrase_id=result.get("phrase_id"),
+                final=result.get("final") is not False,
             )
+            self._endUtterance("mic", result)
 
     def speakerMessage(self, result:dict) -> None:
+        if result.get("text") == "" and result.get("final") is True:
+            self._endUtterance("speaker", result)
+            return
+
         if result.get("recognition_error") is True:
             is_pipeline_error = all(
                 key in result for key in ("error_code", "stage", "source", "message", "recoverable")
@@ -1345,7 +1396,9 @@ class Controller:
             self._processMessage(
                 SPEAKER_MESSAGE_SPEC, message, language,
                 asr_ms=result.get("asr_ms"), phrase_id=result.get("phrase_id"),
+                final=result.get("final") is not False,
             )
+            self._endUtterance("speaker", result)
 
     def ocrMessage(self, result: dict) -> None:
         """OCRで読んだチャット吹き出しを、受信メッセージと同じ経路へ流す。
@@ -3821,6 +3874,9 @@ class Controller:
     def _stopTranscriptionSendMessageLocked(self) -> None:
         """mic_lifecycle_lock を既に保持している呼び出し元専用。"""
         model.stopMicTranscript()
+        # 止めた時点で話の途中だった発話は、終わりの知らせが来ない。
+        # 書き出し待ちのログの行をここで書く。
+        model.flushLogMessages()
 
     def stopTranscriptionSendMessage(self) -> None:
         with self.mic_lifecycle_lock:
@@ -3871,6 +3927,9 @@ class Controller:
     def _stopTranscriptionReceiveMessageLocked(self) -> None:
         """speaker_lifecycle_lock を既に保持している呼び出し元専用。"""
         model.stopSpeakerTranscript()
+        # 止めた時点で話の途中だった発話は、終わりの知らせが来ない。
+        # 書き出し待ちのログの行をここで書く。
+        model.flushLogMessages()
 
     def stopTranscriptionReceiveMessage(self) -> None:
         with self.speaker_lifecycle_lock:

@@ -1,6 +1,6 @@
 from os import path as os_path
 from datetime import datetime
-from typing import Tuple, List, Optional
+from typing import Any, Tuple, List, Optional
 from PIL import Image, ImageDraw, ImageFont
 try:
     from utils import errorLogging
@@ -550,7 +550,7 @@ class OverlayImage:
 
         return combined_img
 
-    def createOverlayImageLargeLog(self, message_type: str, message: Optional[str] = None, your_language: Optional[str] = None, translation: List[str] = [], target_language: List[str] = [], transliteration_message: List[dict] = [], transliteration_translation: List[List[dict]] = [], ruby_font_scale: float = 0.5, ruby_line_spacing: int = 4) -> Image:
+    def createOverlayImageLargeLog(self, message_type: str, message: Optional[str] = None, your_language: Optional[str] = None, translation: List[str] = [], target_language: List[str] = [], transliteration_message: List[dict] = [], transliteration_translation: List[List[dict]] = [], ruby_font_scale: float = 0.5, ruby_line_spacing: int = 4, entry_id: Any = None) -> Image:
         ui_color = self.getUiColorLargeLog()
         background_color = ui_color["background_color"]
         background_outline_color = ui_color["background_outline_color"]
@@ -560,7 +560,7 @@ class OverlayImage:
         ui_radius = ui_size["radius"]
         ui_clause_margin = ui_size["clause_margin"]
 
-        self.message_log.append({
+        entry = {
             "message_type": message_type,
             "message": message,
             "your_language": your_language,
@@ -568,8 +568,22 @@ class OverlayImage:
             "target_language": target_language,
             "transliteration_message": transliteration_message,
             "transliteration_translation": transliteration_translation,
-            "datetime": datetime.now().strftime("%H:%M")
-        })
+            "datetime": datetime.now().strftime("%H:%M"),
+            "entry_id": entry_id,
+        }
+        # 文字起こしは、話している間、同じ発話の「ここまでの全文」を何度も出す。
+        # 1 件ずつ積むと、5 件しか無いログが同じ発話の途中経過で埋まり、その前の
+        # 会話が押し出される。同じ entry_id の行があれば、その行を置き換える。
+        existing = None
+        if entry_id is not None:
+            existing = next(
+                (i for i, log in enumerate(self.message_log) if log.get("entry_id") == entry_id), None
+            )
+        if existing is not None:
+            entry["datetime"] = self.message_log[existing]["datetime"]
+            self.message_log[existing] = entry
+        else:
+            self.message_log.append(entry)
 
         if len(self.message_log) > 5:
             self.message_log = self.message_log[-5:]
