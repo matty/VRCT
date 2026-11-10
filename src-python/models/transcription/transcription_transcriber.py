@@ -579,20 +579,41 @@ class AudioTranscriber:
                 provider_error = RuntimeError("transcription provider is unavailable")
             else:
                 force_language = len(languages) == 1
+                # 候補言語が複数あるとき、自分で言語を検出するエンジン (ローカル Whisper・
+                # OpenAI 互換 API) は 1 回の呼び出しで済ませる。言語を指定しない呼び出しは
+                # どの候補に対して呼んでも同じ結果になるので、候補ごとに呼び直しても
+                # 時間 (と API の課金) が増えるだけだった。Google は候補ごとに別の認識に
+                # なるので従来どおり全候補を試す。
+                transcribe_candidates = None
+                if len(languages) > 1 and callable(getattr(type(provider), "transcribe_candidates", None)):
+                    transcribe_candidates = provider.transcribe_candidates
                 for language, country in zip(languages, countries):
                     call_started_at = time.perf_counter()
                     try:
-                        text, confidence, is_definitive = provider.transcribe(
-                            audio_data,
-                            language,
-                            country,
-                            avg_logprob=avg_logprob,
-                            no_speech_prob=no_speech_prob,
-                            no_repeat_ngram_size=no_repeat_ngram_size,
-                            force_language=force_language,
-                        )
+                        if transcribe_candidates is not None:
+                            text, confidence, index = transcribe_candidates(
+                                audio_data,
+                                list(zip(languages, countries)),
+                                avg_logprob=avg_logprob,
+                                no_speech_prob=no_speech_prob,
+                                no_repeat_ngram_size=no_repeat_ngram_size,
+                            )
+                            language = languages[index]
+                            is_definitive = True
+                        else:
+                            text, confidence, is_definitive = provider.transcribe(
+                                audio_data,
+                                language,
+                                country,
+                                avg_logprob=avg_logprob,
+                                no_speech_prob=no_speech_prob,
+                                no_repeat_ngram_size=no_repeat_ngram_size,
+                                force_language=force_language,
+                            )
                     except UnknownValueError:
                         language_calls.append(f"{language}=nomatch")
+                        if transcribe_candidates is not None:
+                            break
                         continue
                     except TranscriptionApiError as exc:
                         self.last_recognition_error = True
@@ -600,12 +621,16 @@ class AudioTranscriber:
                         provider_error = provider_error or exc
                         language_calls.append(f"{language}=error")
                         errorLogging()
+                        if transcribe_candidates is not None:
+                            break
                         continue
                     except Exception as exc:  # noqa: BLE001 - convert to pipeline failure
                         self.last_recognition_error = True
                         provider_error = provider_error or exc
                         language_calls.append(f"{language}=error")
                         errorLogging()
+                        if transcribe_candidates is not None:
+                            break
                         continue
 
                     elapsed_ms = round((time.perf_counter() - call_started_at) * 1000)
@@ -621,6 +646,11 @@ class AudioTranscriber:
                         # 失敗率の内訳 (nomatch なのか timeout なのか) を
                         # 実ログから追えない。
                         language_calls.append(f"{language}=nomatch({elapsed_ms}ms)")
+                    if transcribe_candidates is not None:
+                        # 1 回の呼び出しが全候補を代表する。confidence が 0 でも
+                        # (言語確率を返さないサーバーなど) 結果を捨てない。
+                        best = {"confidence": confidence, "text": text, "language": language}
+                        break
                     if confidence > best["confidence"]:
                         best = {"confidence": confidence, "text": text, "language": language}
                     if is_definitive:

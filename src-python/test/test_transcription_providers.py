@@ -167,6 +167,75 @@ class TestLocalWhisperProvider(unittest.TestCase):
 
         self.assertFalse(is_definitive)
 
+    # --- transcribe_candidates: 候補言語が複数あるときの 1 回での文字起こし ---
+
+    _CANDIDATES = [("English", "United States"), ("Korean", "South Korea"), ("Chinese Simplified", "China")]
+
+    def _info(self, language: str, probability: float, **probabilities: float) -> SimpleNamespace:
+        all_probs = sorted({language: probability, **probabilities}.items(), key=lambda kv: -kv[1])
+        return SimpleNamespace(language=language, language_probability=probability, all_language_probs=all_probs)
+
+    def test_candidates_detected_language_is_a_candidate_decodes_once(self) -> None:
+        whisper_model = MagicMock()
+        whisper_model.transcribe.return_value = ([_segment("annyeong")], self._info("ko", 0.9, en=0.05))
+        provider = LocalWhisperProvider(whisper_model)
+
+        text, confidence, index = provider.transcribe_candidates(
+            self._make_audio_data(), self._CANDIDATES,
+            avg_logprob=-0.8, no_speech_prob=0.6, no_repeat_ngram_size=0,
+        )
+
+        self.assertEqual((text, confidence, index), ("annyeong", 0.9, 1))
+        self.assertEqual(whisper_model.transcribe.call_count, 1)
+        self.assertIsNone(whisper_model.transcribe.call_args.kwargs["language"])
+
+    def test_candidates_language_that_is_not_a_candidate_decodes_once(self) -> None:
+        # 候補のどれでもない言語 (日本語) で話されている。以前は候補の数だけ
+        # 同じデコードを繰り返していた。聞こえたままを最初の候補として返す。
+        whisper_model = MagicMock()
+        whisper_model.transcribe.return_value = (
+            [_segment("konnichiwa")],
+            self._info("ja", 0.97, en=0.01, ko=0.005, zh=0.01),
+        )
+        provider = LocalWhisperProvider(whisper_model)
+
+        text, confidence, index = provider.transcribe_candidates(
+            self._make_audio_data(), self._CANDIDATES,
+            avg_logprob=-0.8, no_speech_prob=0.6, no_repeat_ngram_size=0,
+        )
+
+        self.assertEqual((text, confidence, index), ("konnichiwa", 0.97, 0))
+        self.assertEqual(whisper_model.transcribe.call_count, 1)
+
+    def test_candidates_same_code_for_two_candidates_uses_the_first(self) -> None:
+        # 簡体字・繁体字はどちらも Whisper では "zh"。
+        whisper_model = MagicMock()
+        whisper_model.transcribe.return_value = ([_segment("ni hao")], self._info("zh", 0.9))
+        provider = LocalWhisperProvider(whisper_model)
+
+        _, _, index = provider.transcribe_candidates(
+            self._make_audio_data(),
+            [("English", "United States"), ("Chinese Traditional", "Taiwan"), ("Chinese Simplified", "China")],
+            avg_logprob=-0.8, no_speech_prob=0.6, no_repeat_ngram_size=0,
+        )
+
+        self.assertEqual(index, 1)
+
+    def test_candidates_filters_low_confidence_segments(self) -> None:
+        whisper_model = MagicMock()
+        whisper_model.transcribe.return_value = (
+            [_segment("good ", avg_logprob=-0.1), _segment("bad ", avg_logprob=-5.0)],
+            self._info("en", 0.9),
+        )
+        provider = LocalWhisperProvider(whisper_model)
+
+        text, _, _ = provider.transcribe_candidates(
+            self._make_audio_data(), self._CANDIDATES,
+            avg_logprob=-0.8, no_speech_prob=0.6, no_repeat_ngram_size=0,
+        )
+
+        self.assertEqual(text, "good ")
+
 
 class TestOpenAICompatibleTranscriptionProvider(unittest.TestCase):
     def _make_audio_data(self) -> MagicMock:
@@ -182,6 +251,79 @@ class TestOpenAICompatibleTranscriptionProvider(unittest.TestCase):
             )
         provider._client = openai_cls.return_value
         return provider
+
+    # --- transcribe_candidates: 候補言語が複数あるときは API を 1 回だけ呼ぶ ---
+
+    _CANDIDATES = [("English", "United States"), ("Japanese", "Japan"), ("Chinese Simplified", "China")]
+
+    def _candidates(self, provider, **response):
+        provider._client.audio.transcriptions.create.return_value = SimpleNamespace(**response)
+        return provider.transcribe_candidates(
+            self._make_audio_data(), self._CANDIDATES,
+            avg_logprob=-0.8, no_speech_prob=0.6, no_repeat_ngram_size=0,
+        )
+
+    def test_candidates_calls_the_api_once_without_a_language(self) -> None:
+        provider = self._make_provider()
+        self._candidates(provider, text="hi", language="de", segments=[_segment("hi")])
+        self.assertEqual(provider._client.audio.transcriptions.create.call_count, 1)
+        self.assertIsNone(provider._client.audio.transcriptions.create.call_args.kwargs["language"])
+
+    def test_candidates_matches_a_language_code(self) -> None:
+        provider = self._make_provider()
+        text, _, index = self._candidates(provider, text="x", language="ja", segments=[_segment("konnichiwa")])
+        self.assertEqual((text, index), ("konnichiwa", 1))
+
+    def test_candidates_matches_a_language_name(self) -> None:
+        # OpenAI 公式の verbose_json は "japanese" のような言語名を返す。
+        provider = self._make_provider()
+        _, _, index = self._candidates(provider, text="x", language="japanese", segments=[_segment("konnichiwa")])
+        self.assertEqual(index, 1)
+
+    def test_candidates_matches_a_capitalised_language_name(self) -> None:
+        provider = self._make_provider()
+        _, _, index = self._candidates(provider, text="x", language="Japanese", segments=[_segment("konnichiwa")])
+        self.assertEqual(index, 1)
+
+    def test_candidates_matches_whisper_names_that_differ_from_vrct_names(self) -> None:
+        provider = self._make_provider()
+        _, _, index = self._candidates(provider, text="x", language="chinese", segments=[_segment("ni hao")])
+        self.assertEqual(index, 2)
+
+    def test_candidates_unselected_language_is_returned_as_the_first_candidate(self) -> None:
+        provider = self._make_provider()
+        text, _, index = self._candidates(provider, text="x", language="german", segments=[_segment("guten tag")])
+        self.assertEqual((text, index), ("guten tag", 0))
+
+    def test_candidates_missing_language_field(self) -> None:
+        provider = self._make_provider()
+        text, confidence, index = self._candidates(provider, text="plain", language=None, segments=None)
+        self.assertEqual((text, confidence, index), ("plain", 0.5, 0))
+
+    def test_candidates_api_error_is_reported(self) -> None:
+        provider = self._make_provider()
+        provider._client.audio.transcriptions.create.side_effect = RateLimitError(
+            "rate limited", response=httpx.Response(429, request=httpx.Request("POST", "https://x")), body=None,
+        )
+        with self.assertRaises(TranscriptionApiError) as ctx:
+            provider.transcribe_candidates(
+                self._make_audio_data(), self._CANDIDATES,
+                avg_logprob=-0.8, no_speech_prob=0.6, no_repeat_ngram_size=0,
+            )
+        self.assertEqual(ctx.exception.error_code, ErrorCode.TRANSCRIPTION_API_RATE_LIMITED)
+
+    def test_is_definitive_when_the_api_reports_the_language_by_name(self) -> None:
+        # 以前はコード ("en") としか比べておらず、言語名を返す API では常に
+        # 「候補と一致しない」扱いになっていた。
+        provider = self._make_provider()
+        provider._client.audio.transcriptions.create.return_value = SimpleNamespace(
+            text="hello", language="english", segments=[_segment("hello")],
+        )
+        _, _, is_definitive = provider.transcribe(
+            self._make_audio_data(), "English", "United States",
+            avg_logprob=-0.8, no_speech_prob=0.6, no_repeat_ngram_size=0, force_language=False,
+        )
+        self.assertTrue(is_definitive)
 
     def test_calls_sdk_with_wav_bytes_and_model(self) -> None:
         provider = self._make_provider()

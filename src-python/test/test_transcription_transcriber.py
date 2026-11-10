@@ -1140,19 +1140,17 @@ class TestDeepgramTranscriptionEngine(unittest.TestCase):
 
 
 class TestWhisperResilienceAcrossCandidates(unittest.TestCase):
-    """ローカル Whisper は1候補目で例外が出ても2候補目を試す
-    (エラーハンドリングを Google/API系と共通化した副次効果)。
+    """ローカル Whisper は候補言語が複数あっても 1 回の呼び出しで全候補を扱う
+    (LocalWhisperProvider.transcribe_candidates)。言語を指定しない呼び出しは
+    どの候補に対して呼んでも同じ結果になるので、失敗しても呼び直さない。
     """
 
     @patch("models.transcription.transcription_transcriber.checkWhisperWeight", return_value=False)
-    def test_continues_to_next_language_after_an_error(self, _) -> None:
+    def test_an_error_is_reported_without_retrying_per_candidate(self, _) -> None:
         transcriber = AudioTranscriber(False, FakeAudioSource(), 3, 10, "Whisper")
         transcriber.transcription_engine = "Whisper"
         transcriber.whisper_model = MagicMock()
-        transcriber.whisper_model.transcribe.side_effect = [
-            RuntimeError("boom"),
-            ([], MagicMock(text="ok", language_probability=0.7, language="ja")),
-        ]
+        transcriber.whisper_model.transcribe.side_effect = RuntimeError("boom")
         audio_queue = Queue()
         audio_queue.put((b"\x01\x00", _already_old_timestamp()))
 
@@ -1163,7 +1161,7 @@ class TestWhisperResilienceAcrossCandidates(unittest.TestCase):
                 )
 
         self.assertTrue(transcriber.last_recognition_error)
-        self.assertEqual(transcriber.whisper_model.transcribe.call_count, 2)
+        self.assertEqual(transcriber.whisper_model.transcribe.call_count, 1)
 
     @patch("models.transcription.transcription_transcriber.checkWhisperWeight", return_value=False)
     def test_does_not_reset_error_flag_at_start_of_call(self, _) -> None:
@@ -1178,6 +1176,158 @@ class TestWhisperResilienceAcrossCandidates(unittest.TestCase):
         transcriber.transcribeAudioQueue(audio_queue, ["Japanese"], ["Japan"])
 
         self.assertTrue(transcriber.last_recognition_error)
+
+
+class TestSinglePassForSeveralCandidateLanguages(unittest.TestCase):
+    """候補言語が複数あるとき、自分で言語を検出するエンジンは 1 回で済ませる。
+
+    以前は、検出された言語が候補に一致するまで候補の数だけ同じ音声を
+    文字起こしし直していた (言語を指定しない呼び出しなので結果は毎回同じ)。
+    スピーカー側は翻訳先の言語が候補になるので、翻訳先を 3 つ選んでいると、
+    候補に無い言語 (自分と同じ言語など) の発話のたびに 3 回デコードしていた。
+    """
+
+    _LANGUAGES = ["English", "Korean", "Chinese Simplified"]
+    _COUNTRIES = ["United States", "South Korea", "China"]
+
+    @staticmethod
+    def _info(language, probability, **probabilities):
+        all_probs = sorted({language: probability, **probabilities}.items(), key=lambda kv: -kv[1])
+        return MagicMock(language=language, language_probability=probability, all_language_probs=all_probs)
+
+    @staticmethod
+    def _segment(text):
+        return MagicMock(text=text, avg_logprob=-0.1, no_speech_prob=0.1)
+
+    def _whisper_transcriber(self):
+        with patch("models.transcription.transcription_transcriber.checkWhisperWeight", return_value=False):
+            transcriber = AudioTranscriber(True, FakeAudioSource(), 3, 10, "Whisper")
+        transcriber.transcription_engine = "Whisper"
+        transcriber.whisper_model = MagicMock()
+        return transcriber
+
+    def _run(self, transcriber):
+        audio_queue = Queue()
+        audio_queue.put((b"\x01\x00" * 1600, _already_old_timestamp()))
+        transcriber.transcribeAudioQueue(audio_queue, self._LANGUAGES, self._COUNTRIES)
+        return transcriber.getTranscript()
+
+    def test_whisper_decodes_once_when_the_language_is_not_a_candidate(self) -> None:
+        transcriber = self._whisper_transcriber()
+        transcriber.whisper_model.transcribe.return_value = (
+            [self._segment("こんにちは")], self._info("ja", 0.98, en=0.01),
+        )
+
+        result = self._run(transcriber)
+
+        self.assertEqual(transcriber.whisper_model.transcribe.call_count, 1)
+        self.assertEqual(result["text"], "こんにちは")
+        self.assertEqual(result["language"], "English")
+
+    def test_whisper_reports_the_detected_candidate_language(self) -> None:
+        transcriber = self._whisper_transcriber()
+        transcriber.whisper_model.transcribe.return_value = (
+            [self._segment("안녕하세요")], self._info("ko", 0.9),
+        )
+
+        result = self._run(transcriber)
+
+        self.assertEqual(transcriber.whisper_model.transcribe.call_count, 1)
+        self.assertEqual(result["language"], "Korean")
+
+    def test_whisper_language_is_the_detected_candidate_even_when_it_is_not_the_first(self) -> None:
+        # 以前は 1 番目の候補 (不一致) と 2 番目の候補 (一致) の呼び出しが同じ
+        # confidence を返し、「より高ければ採用」で最初の候補が残っていた。
+        # 中国語の発話が "English" として翻訳に回っていた。
+        transcriber = self._whisper_transcriber()
+        transcriber.whisper_model.transcribe.return_value = (
+            [self._segment("你好")], self._info("zh", 0.9),
+        )
+
+        result = self._run(transcriber)
+
+        self.assertEqual(result["language"], "Chinese Simplified")
+
+    def test_whisper_single_candidate_still_forces_the_language(self) -> None:
+        transcriber = self._whisper_transcriber()
+        transcriber.whisper_model.transcribe.return_value = (
+            [self._segment("hello")], self._info("en", 1.0),
+        )
+        audio_queue = Queue()
+        audio_queue.put((b"\x01\x00" * 1600, _already_old_timestamp()))
+
+        transcriber.transcribeAudioQueue(audio_queue, ["English"], ["United States"])
+
+        self.assertEqual(transcriber.whisper_model.transcribe.call_count, 1)
+        self.assertEqual(transcriber.whisper_model.transcribe.call_args.kwargs["language"], "en")
+
+    def test_whisper_calls_are_visible_in_the_breakdown(self) -> None:
+        transcriber = self._whisper_transcriber()
+        transcriber.whisper_model.transcribe.return_value = (
+            [self._segment("안녕하세요")], self._info("ko", 0.9),
+        )
+        with patch("models.transcription.transcription_transcriber.printLog") as print_log:
+            self._run(transcriber)
+
+        stats = [call.args[0] for call in print_log.call_args_list if "[ASR-stats]" in call.args[0]]
+        self.assertEqual(len(stats), 1)
+        self.assertIn("calls=1/3", stats[0])
+        self.assertIn("Korean=", stats[0])
+
+    def _api_transcriber(self):
+        from models.transcription.transcription_providers import OpenAICompatibleTranscriptionProvider
+
+        with patch("models.transcription.transcription_transcriber.checkWhisperWeight", return_value=False), \
+                patch("models.transcription.transcription_providers.OpenAI") as openai_cls:
+            transcriber = AudioTranscriber(
+                True, FakeAudioSource(), 3, 10, "OpenAI_Whisper",
+                api_key="sk-test", base_url="https://api.openai.com/v1", api_model="whisper-1",
+            )
+        self.assertIsInstance(transcriber._api_provider, OpenAICompatibleTranscriptionProvider)
+        return transcriber, openai_cls.return_value.audio.transcriptions.create
+
+    def test_api_is_called_once_and_billed_once(self) -> None:
+        transcriber, create = self._api_transcriber()
+        create.return_value = MagicMock(text="こんにちは", language="japanese", segments=[self._segment("こんにちは")])
+
+        result = self._run(transcriber)
+
+        self.assertEqual(create.call_count, 1)
+        self.assertEqual(result["text"], "こんにちは")
+        self.assertEqual(result["language"], "English")
+
+    def test_api_language_name_is_mapped_to_the_candidate(self) -> None:
+        transcriber, create = self._api_transcriber()
+        create.return_value = MagicMock(text="안녕하세요", language="korean", segments=[self._segment("안녕하세요")])
+
+        result = self._run(transcriber)
+
+        self.assertEqual(create.call_count, 1)
+        self.assertEqual(result["language"], "Korean")
+
+    def test_api_error_is_not_retried_per_candidate(self) -> None:
+        transcriber, create = self._api_transcriber()
+        create.side_effect = RuntimeError("boom")
+        audio_queue = Queue()
+        audio_queue.put((b"\x01\x00" * 1600, _already_old_timestamp()))
+
+        with patch("models.transcription.transcription_transcriber.errorLogging"), \
+                patch("models.transcription.transcription_providers.errorLogging"):
+            with self.assertRaises(AudioPipelineError):
+                transcriber.transcribeAudioQueue(audio_queue, self._LANGUAGES, self._COUNTRIES)
+
+        self.assertEqual(create.call_count, 1)
+        self.assertTrue(transcriber.last_recognition_error)
+        self.assertEqual(transcriber.last_api_error_code, ErrorCode.TRANSCRIPTION_API_SERVER_ERROR)
+
+    def test_google_still_tries_every_candidate(self) -> None:
+        with patch("models.transcription.transcription_transcriber.checkWhisperWeight", return_value=False):
+            transcriber = AudioTranscriber(True, FakeAudioSource(), 3, 10, "Google")
+        transcriber.audio_recognizer.recognize_google = MagicMock(return_value=("hello", 0.9))
+
+        self._run(transcriber)
+
+        self.assertEqual(transcriber.audio_recognizer.recognize_google.call_count, 3)
 
 
 class TestMutedMicMessage(unittest.TestCase):
