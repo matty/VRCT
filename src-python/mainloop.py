@@ -562,6 +562,10 @@ mapping = {
     "/set/enable/send_only_translated_messages": {"status": True, "variable":controller.setEnableSendOnlyTranslatedMessages},
     "/set/disable/send_only_translated_messages": {"status": True, "variable":controller.setDisableSendOnlyTranslatedMessages},
 
+    "/get/data/split_long_chatbox_messages": {"status": True, "variable":controller.getSplitLongChatboxMessages},
+    "/set/enable/split_long_chatbox_messages": {"status": True, "variable":controller.setEnableSplitLongChatboxMessages},
+    "/set/disable/split_long_chatbox_messages": {"status": True, "variable":controller.setDisableSplitLongChatboxMessages},
+
     "/get/data/logger_feature": {"status": True, "variable":controller.getLoggerFeature},
     "/set/enable/logger_feature": {"status": True, "variable":controller.setEnableLoggerFeature},
     "/set/disable/logger_feature": {"status": True, "variable":controller.setDisableLoggerFeature},

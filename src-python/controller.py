@@ -15,6 +15,7 @@ from errors import ErrorCode, OcrStartError, VRCTError
 from models.transcription.transcription_openai_compatible import TRANSCRIPTION_MODEL_KEYWORDS, TRANSCRIPTION_API_ENGINES
 from models.translation.translation_providers import TRANSLATION_PROVIDER_REGISTRY, CONNECTION_PROVIDER_REGISTRY
 from models.message_pipeline import MessageDirectionSpec, MIC_MESSAGE_SPEC, SPEAKER_MESSAGE_SPEC, CHAT_MESSAGE_SPEC, OCR_MESSAGE_SPEC
+from models.osc.chatbox_pages import buildChatboxPages
 from models.overlay.overlay_tooltip import validate_tooltip
 from models.overlay.overlay import PANEL_ANCHORS, computeVrLayout, clampPanelSize, mirrorHandPosition
 
@@ -250,6 +251,7 @@ _SIMPLE_CONFIG_GETTERS = {
     "getReceivedMessageFormatParts": "RECEIVED_MESSAGE_FORMAT_PARTS",
     "getAutoClearMessageBox": "AUTO_CLEAR_MESSAGE_BOX",
     "getSendOnlyTranslatedMessages": "SEND_ONLY_TRANSLATED_MESSAGES",
+    "getSplitLongChatboxMessages": "SPLIT_LONG_CHATBOX_MESSAGES",
     "getOverlaySmallLog": "OVERLAY_SMALL_LOG",
     "getOverlaySmallLogSettings": "OVERLAY_SMALL_LOG_SETTINGS",
     "getOverlayLargeLog": "OVERLAY_LARGE_LOG",
@@ -1138,12 +1140,12 @@ class Controller:
             if spec.osc_send_gate_attr is not None and getattr(config, spec.osc_send_gate_attr) is True:
                 if config.SEND_ONLY_TRANSLATED_MESSAGES is True:
                     if config.ENABLE_TRANSLATION is False:
-                        osc_message = self.messageFormatter(spec.osc_format_type, [], message)
+                        osc_translation, osc_original = [], message
                     else:
-                        osc_message = self.messageFormatter(spec.osc_format_type, translation, "")
+                        osc_translation, osc_original = translation, ""
                 else:
-                    osc_message = self.messageFormatter(spec.osc_format_type, translation, message)
-                model.oscSendMessage(osc_message)
+                    osc_translation, osc_original = translation, message
+                self._sendChatboxMessage(spec.osc_format_type, osc_translation, osc_original)
 
             if spec.overlay_small_log and config.OVERLAY_SMALL_LOG is True and self._is_overlay_available():
                 if config.OVERLAY_SHOW_ONLY_TRANSLATED_MESSAGES is True:
@@ -3333,6 +3335,21 @@ class Controller:
 
 
     @staticmethod
+    def setEnableSplitLongChatboxMessages(*args, **kwargs) -> dict:
+        if config.SPLIT_LONG_CHATBOX_MESSAGES is False:
+            config.SPLIT_LONG_CHATBOX_MESSAGES = True
+        return {"status":200, "result":config.SPLIT_LONG_CHATBOX_MESSAGES}
+
+    @staticmethod
+    def setDisableSplitLongChatboxMessages(*args, **kwargs) -> dict:
+        if config.SPLIT_LONG_CHATBOX_MESSAGES is True:
+            config.SPLIT_LONG_CHATBOX_MESSAGES = False
+            # Pages of a message that is already being shown would otherwise keep coming.
+            model.oscCancelPendingPages()
+        return {"status":200, "result":config.SPLIT_LONG_CHATBOX_MESSAGES}
+
+
+    @staticmethod
     def syncOverlayRunning() -> None:
         """字幕 (一行 / 複数行) と VR UI のどれかがONならオーバーレイを動かし、全部OFFなら止める。"""
         model.setVrPanelEnabled(config.OVERLAY_VR_PANEL)
@@ -3438,6 +3455,7 @@ class Controller:
     def setDisableSendMessageToVrc(*args, **kwargs) -> dict:
         if config.SEND_MESSAGE_TO_VRC is True:
             config.SEND_MESSAGE_TO_VRC = False
+            model.oscCancelPendingPages()
         return {"status":200, "result":config.SEND_MESSAGE_TO_VRC}
 
 
@@ -3451,6 +3469,7 @@ class Controller:
     def setDisableSendReceivedMessageToVrc(*args, **kwargs) -> dict:
         if config.SEND_RECEIVED_MESSAGE_TO_VRC is True:
             config.SEND_RECEIVED_MESSAGE_TO_VRC = False
+            model.oscCancelPendingPages()
         return {"status":200, "result":config.SEND_RECEIVED_MESSAGE_TO_VRC}
 
 
@@ -3701,6 +3720,28 @@ class Controller:
         else:
             osc_message = message_part
         return osc_message
+
+    def _sendChatboxMessage(self, format_type: str, translation: list, message: str) -> None:
+        """Send one message to the VRChat chatbox.
+
+        VRChat shows at most 144 characters and drops the rest. With the
+        default format the original comes first, so what gets cut is the end
+        of the translation. A message over the limit is split into pages,
+        each rendered with the user's format and sent one after another.
+        """
+        if config.SPLIT_LONG_CHATBOX_MESSAGES is not True:
+            model.oscSendMessage(self.messageFormatter(format_type, translation, message))
+            return
+        pages = buildChatboxPages(
+            message,
+            translation,
+            lambda page_translation, page_message: self.messageFormatter(format_type, page_translation, page_message),
+        )
+        if len(pages) == 1:
+            model.oscSendMessage(pages[0])
+        else:
+            printLog(f"[chatbox] message over the VRChat limit, sending {len(pages)} pages")
+            model.oscSendMessagePages(pages)
 
     def changeToCTranslate2Process(self) -> None:
         selected_engines = config.SELECTED_TRANSLATION_ENGINES[config.SELECTED_TAB_NO]

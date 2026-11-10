@@ -29,6 +29,7 @@ _CONFIG_KEYS = [
     "SEND_MESSAGE_TO_VRC",
     "SEND_RECEIVED_MESSAGE_TO_VRC",
     "SEND_ONLY_TRANSLATED_MESSAGES",
+    "SPLIT_LONG_CHATBOX_MESSAGES",
     "OVERLAY_LARGE_LOG",
     "OVERLAY_SMALL_LOG",
     "OVERLAY_SHOW_ONLY_TRANSLATED_MESSAGES",
@@ -90,6 +91,7 @@ class _MessagePipelineTestBase(unittest.TestCase):
         config.SEND_MESSAGE_TO_VRC = True
         config.SEND_RECEIVED_MESSAGE_TO_VRC = True
         config.SEND_ONLY_TRANSLATED_MESSAGES = False
+        config.SPLIT_LONG_CHATBOX_MESSAGES = True
         config.OVERLAY_LARGE_LOG = False
         config.OVERLAY_SMALL_LOG = False
         config.OVERLAY_SHOW_ONLY_TRANSLATED_MESSAGES = False
@@ -117,6 +119,7 @@ class _MessagePipelineTestBase(unittest.TestCase):
             ("detectVRAMError", MagicMock(return_value=(False, ""))),
             ("convertMessageToTransliteration", MagicMock(return_value=["TRANSLITERATED"])),
             ("oscSendMessage", MagicMock()),
+            ("oscSendMessagePages", MagicMock()),
             ("createOverlayImageLargeLog", MagicMock(return_value="LARGE_IMG")),
             ("createOverlayImageSmallLog", MagicMock(return_value="SMALL_IMG")),
             ("updateOverlayLargeLog", MagicMock()),
@@ -296,6 +299,48 @@ class TestMicMessage(_MessagePipelineTestBase):
         # SEND_MESSAGE_FORMAT_PARTS の既定は translation_first=False なので
         # メッセージが先、翻訳が後になる。
         self._model.oscSendMessage.assert_called_once_with("hello\nhola")
+
+    def test_osc_message_over_the_vrchat_limit_is_sent_as_pages(self) -> None:
+        # VRChat は144文字で切り捨てる。既定の書式では原文が先なので、切れるのは
+        # 訳文の後半になる。分割して全部届ける。
+        message = "This is the first sentence of a long message. " * 3
+        translation = "これは長いメッセージの最初の文です。" * 3
+        self._model.getInputTranslate.return_value = ([translation], [True])
+        self.controller.micMessage({"text": message.strip(), "language": "English"})
+        self._model.oscSendMessage.assert_not_called()
+        self._model.oscSendMessagePages.assert_called_once()
+        pages = self._model.oscSendMessagePages.call_args.args[0]
+        self.assertGreater(len(pages), 1)
+        for page in pages:
+            self.assertLessEqual(len(page), 144)
+            original, translated = page.split("\n")
+            self.assertTrue(original.startswith("This is the first sentence"))
+            self.assertTrue(translated.startswith("これは長いメッセージ"))
+        self.assertEqual("".join(pages).count("これは長いメッセージの最初の文です。"), 3)
+
+    def test_osc_long_message_is_sent_whole_when_splitting_is_disabled(self) -> None:
+        config.SPLIT_LONG_CHATBOX_MESSAGES = False
+        message = ("This is the first sentence of a long message. " * 3).strip()
+        translation = "これは長いメッセージの最初の文です。" * 3
+        self._model.getInputTranslate.return_value = ([translation], [True])
+        self.controller.micMessage({"text": message, "language": "English"})
+        self._model.oscSendMessagePages.assert_not_called()
+        self._model.oscSendMessage.assert_called_once_with(f"{message}\n{translation}")
+
+    def test_osc_long_message_pages_use_the_send_format(self) -> None:
+        parts = config.SEND_MESSAGE_FORMAT_PARTS
+        parts["translation"]["prefix"] = "("
+        parts["translation"]["suffix"] = ")"
+        parts["translation_first"] = True
+        config.SEND_MESSAGE_FORMAT_PARTS = parts
+        message = ("This is the first sentence of a long message. " * 3).strip()
+        translation = "これは長いメッセージの最初の文です。" * 3
+        self._model.getInputTranslate.return_value = ([translation], [True])
+        self.controller.micMessage({"text": message, "language": "English"})
+        pages = self._model.oscSendMessagePages.call_args.args[0]
+        for page in pages:
+            self.assertTrue(page.startswith("(これは長いメッセージ"), page)
+            self.assertIn(")\nThis is the first sentence", page)
 
     def test_clipboard_copies_when_enabled(self) -> None:
         config.ENABLE_CLIPBOARD = True

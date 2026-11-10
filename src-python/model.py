@@ -1680,6 +1680,15 @@ class Model:
         self.ensure_initialized()
         self.osc_handler.sendMessage(message=message, notification=config.NOTIFICATION_VRC_SFX)
 
+    def oscSendMessagePages(self, pages: list):
+        """Send a chatbox message split into pages (models/osc/chatbox_pages.py)."""
+        self.ensure_initialized()
+        self.osc_handler.sendMessagePages(pages, notification=config.NOTIFICATION_VRC_SFX)
+
+    def oscCancelPendingPages(self):
+        self.ensure_initialized()
+        self.osc_handler.cancelPendingPages()
+
     def setMuteSelfStatus(self):
         self.ensure_initialized()
         self.mic_mute_status = self.osc_handler.getOSCParameterMuteSelf()

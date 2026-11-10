@@ -33,6 +33,7 @@ export const Others = () => {
             <div>
                 <AutoClearMessageInputBoxContainer />
                 <SendOnlyTranslatedMessagesContainer />
+                <SplitLongChatboxMessagesContainer />
                 <AutoExportMessageLogsContainer />
                 <VrcMicMuteSyncContainer />
                 <SendMessageToVrcContainer />
@@ -84,6 +85,20 @@ const SendOnlyTranslatedMessagesContainer = () => {
             label={t("config_page.others.send_only_translated_messages.label")}
             variable={currentEnableSendOnlyTranslatedMessages}
             toggleFunction={toggleEnableSendOnlyTranslatedMessages}
+        />
+    );
+};
+const SplitLongChatboxMessagesContainer = () => {
+    const { t } = useI18n();
+    const { currentEnableSplitLongChatboxMessages, toggleEnableSplitLongChatboxMessages } = useOthers();
+
+    return (
+        <CheckboxContainer
+            setting_id="split_long_chatbox_messages"
+            label={t("config_page.others.split_long_chatbox_messages.label")}
+            desc={t("config_page.others.split_long_chatbox_messages.desc")}
+            variable={currentEnableSplitLongChatboxMessages}
+            toggleFunction={toggleEnableSplitLongChatboxMessages}
         />
     );
 };

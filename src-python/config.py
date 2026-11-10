@@ -995,6 +995,9 @@ class Config:
     OSC_PORT = ManagedProperty('OSC_PORT', type_=int)
     AUTO_CLEAR_MESSAGE_BOX = ManagedProperty('AUTO_CLEAR_MESSAGE_BOX', type_=bool)
     SEND_ONLY_TRANSLATED_MESSAGES = ManagedProperty('SEND_ONLY_TRANSLATED_MESSAGES', type_=bool)
+    # VRChat cuts chatbox messages at 144 characters. When on, a longer message is sent as
+    # several pages, one after another (models/osc/chatbox_pages.py)
+    SPLIT_LONG_CHATBOX_MESSAGES = ManagedProperty('SPLIT_LONG_CHATBOX_MESSAGES', type_=bool)
     OVERLAY_SMALL_LOG = ManagedProperty('OVERLAY_SMALL_LOG', type_=bool)
     OVERLAY_LARGE_LOG = ManagedProperty('OVERLAY_LARGE_LOG', type_=bool)
     # VR UI (手首のランチャーとログ・言語・VR設定のウィンドウ)。字幕のオーバーレイとは別にON/OFFする
@@ -1315,6 +1318,7 @@ class Config:
         self._SELECTED_TRANSCRIPTION_COMPUTE_TYPE = "auto"
         self._AUTO_CLEAR_MESSAGE_BOX = True
         self._SEND_ONLY_TRANSLATED_MESSAGES = False
+        self._SPLIT_LONG_CHATBOX_MESSAGES = True
         self._OVERLAY_SMALL_LOG = False
         self._OVERLAY_SMALL_LOG_SETTINGS = {
             "x_pos": 0.0,

@@ -358,6 +358,9 @@ config_page:
             label: "送信後はメッセージ入力欄を空にする"
         send_only_translated_messages:
             label: "翻訳後のメッセージのみ送信する"
+        split_long_chatbox_messages:
+            label: "長いチャットボックスのメッセージを分割する"
+            desc: "VRChatのチャットボックスは144文字までしか表示されず、それ以降 (多くの場合は翻訳文の後半) は切り捨てられます。有効にすると、長いメッセージを複数のページに分け、(1/2) のような印を付けて約5秒ごとに順番に表示します。"
         auto_export_message_logs:
             label: "会話ログを自動的に保存する"
             desc: "テキストファイルとしてログがlogsフォルダ内に保存されます。"

@@ -8,9 +8,9 @@ available.
 """
 
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 from time import sleep
-from threading import Thread
+from threading import Event, Lock, Thread
 from pythonosc import udp_client, dispatcher, osc_server
 try:
     from tinyoscquery.queryservice import OSCQueryService
@@ -40,6 +40,12 @@ except Exception:
     def printLog(log: str, data: Any = None) -> None:
         print(log, data)
 
+# How long each page of a split chatbox message stays up before the next one
+# replaces it (see models/osc/chatbox_pages.py). VRChat rate-limits chatbox
+# updates (updates that come too fast are dropped and the chatbox is muted
+# for a while), so this must stay well above about 1.5 seconds.
+CHATBOX_PAGE_INTERVAL_SECONDS = 5.0
+
 
 class OSCHandler:
     """Thin wrapper managing OSC send/receive and optional OSCQuery advertising.
@@ -68,6 +74,11 @@ class OSCHandler:
         self.osc_server_port: Optional[int] = None
         self.dict_filter_and_target: Dict[str, Callable] = {}
         self.browser = None
+        # Pages of a split chatbox message that are still waiting to be sent.
+        # A newer message cancels them: the chatbox only ever shows the most
+        # recent message, so finishing an old one would hide the new one.
+        self._chatbox_lock = Lock()
+        self._chatbox_cancel_pending: Optional[Event] = None
 
     def getIsOscQueryEnabled(self) -> bool:
         """Return whether OSCQuery support is enabled (local addresses only)."""
@@ -102,7 +113,63 @@ class OSCHandler:
         compatibility by sending [message, True, notification].
         """
         if len(message) > 0:
-            self.udp_client.send_message(self.osc_parameter_chatbox_input, [f"{message}", True, notification])
+            self.sendMessagePages([message], notification=notification)
+
+    def sendMessagePages(
+        self,
+        pages: List[str],
+        notification: bool = True,
+        interval: float = CHATBOX_PAGE_INTERVAL_SECONDS,
+    ) -> None:
+        """Send a chatbox message that was split into pages.
+
+        The first page goes out immediately; each following page replaces it
+        after `interval` seconds, without the notification sound (one message
+        should ping once). Sending anything else in the meantime drops the
+        pages that are still waiting.
+        """
+        pages = [page for page in pages if len(page) > 0]
+        with self._chatbox_lock:
+            if self._chatbox_cancel_pending is not None:
+                self._chatbox_cancel_pending.set()
+                self._chatbox_cancel_pending = None
+            if not pages:
+                return
+            self._sendChatboxInput(pages[0], notification)
+            if len(pages) == 1:
+                return
+            cancel = Event()
+            self._chatbox_cancel_pending = cancel
+        Thread(
+            target=self._sendRemainingPages,
+            args=(pages[1:], cancel, interval),
+            daemon=True,
+        ).start()
+
+    def cancelPendingPages(self) -> None:
+        """Drop the pages of a split message that have not been sent yet."""
+        with self._chatbox_lock:
+            if self._chatbox_cancel_pending is not None:
+                self._chatbox_cancel_pending.set()
+                self._chatbox_cancel_pending = None
+
+    def _sendChatboxInput(self, message: str, notification: bool) -> None:
+        self.udp_client.send_message(self.osc_parameter_chatbox_input, [f"{message}", True, notification])
+
+    def _sendRemainingPages(self, pages: List[str], cancel: Event, interval: float) -> None:
+        for page in pages:
+            if cancel.wait(interval):
+                return
+            with self._chatbox_lock:
+                # Checked again under the lock: a new message may have been
+                # sent between the wait timing out and this point.
+                if cancel.is_set():
+                    return
+                try:
+                    self._sendChatboxInput(page, False)
+                except Exception:
+                    errorLogging()
+                    return
 
     def getOSCParameterValue(self, address: str) -> Any:
         if not self.is_osc_query_enabled:

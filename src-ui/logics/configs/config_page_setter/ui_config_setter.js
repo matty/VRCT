@@ -868,6 +868,14 @@ export const SETTINGS_ARRAY = [
     },
     {
         Category: "Others",
+        Base_Name: "EnableSplitLongChatboxMessages",
+        default_value: true,
+        ui_template_id: "toggle",
+        logics_template_id: "toggle_enable_disable",
+        base_endpoint_name: "split_long_chatbox_messages",
+    },
+    {
+        Category: "Others",
         Base_Name: "EnableAutoExportMessageLogs",
         default_value: false,
         ui_template_id: "toggle",

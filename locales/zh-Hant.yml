@@ -352,6 +352,9 @@ config_page:
             label: "自動清除 Chatbox"
         send_only_translated_messages:
             label: "僅發送翻譯訊息"
+        split_long_chatbox_messages:
+            label: "分割過長的聊天框訊息"
+            desc: "VRChat 聊天框最多顯示 144 個字元，超出的部分（通常是譯文的後半段）會被截斷。啟用後，較長的訊息會被分成多頁，並帶有 (1/2) 這樣的標記，每頁約 5 秒依序顯示。"
         auto_export_message_logs:
             label: "自動匯出訊息記錄"
             desc: "自動將對話訊息匯出為文字文件。"

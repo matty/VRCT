@@ -358,6 +358,9 @@ config_page:
             label: "Auto Clear Message box"
         send_only_translated_messages:
             label: "Send Only Translated Messages"
+        split_long_chatbox_messages:
+            label: "Split Long Chatbox Messages"
+            desc: "VRChat's chatbox shows at most 144 characters and cuts off the rest, which is usually the end of the translation. When enabled, a longer message is sent as several pages, shown one after another (about 5 seconds each) and marked like (1/2)."
         auto_export_message_logs:
             label: "Auto Save Message Logs"
             desc: "Automatically saves the conversation messages as text files."
