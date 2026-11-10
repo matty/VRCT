@@ -995,8 +995,8 @@ class Config:
     OSC_PORT = ManagedProperty('OSC_PORT', type_=int)
     AUTO_CLEAR_MESSAGE_BOX = ManagedProperty('AUTO_CLEAR_MESSAGE_BOX', type_=bool)
     SEND_ONLY_TRANSLATED_MESSAGES = ManagedProperty('SEND_ONLY_TRANSLATED_MESSAGES', type_=bool)
-    # VRChat cuts chatbox messages at 144 characters. When on, a longer message is sent as
-    # several pages, one after another (models/osc/chatbox_pages.py)
+    # VRChat's chatbox shows one message of at most 144 characters. When on, messages are queued
+    # and played through in order, page by page (models/osc/chatbox_player.py). Off: sent at once
     SPLIT_LONG_CHATBOX_MESSAGES = ManagedProperty('SPLIT_LONG_CHATBOX_MESSAGES', type_=bool)
     OVERLAY_SMALL_LOG = ManagedProperty('OVERLAY_SMALL_LOG', type_=bool)
     OVERLAY_LARGE_LOG = ManagedProperty('OVERLAY_LARGE_LOG', type_=bool)

@@ -15,7 +15,6 @@ from errors import ErrorCode, OcrStartError, VRCTError
 from models.transcription.transcription_openai_compatible import TRANSCRIPTION_MODEL_KEYWORDS, TRANSCRIPTION_API_ENGINES
 from models.translation.translation_providers import TRANSLATION_PROVIDER_REGISTRY, CONNECTION_PROVIDER_REGISTRY
 from models.message_pipeline import MessageDirectionSpec, MIC_MESSAGE_SPEC, SPEAKER_MESSAGE_SPEC, CHAT_MESSAGE_SPEC, OCR_MESSAGE_SPEC
-from models.osc.chatbox_pages import buildChatboxPages
 from models.overlay.overlay_tooltip import validate_tooltip
 from models.overlay.overlay import PANEL_ANCHORS, computeVrLayout, clampPanelSize, mirrorHandPosition
 
@@ -1009,6 +1008,10 @@ class Controller:
         # した場合は出力自体が無いので測らない。
         pipeline_started_at = time.perf_counter()
         translate_elapsed_ms = 0
+        # 文字起こしは、話している間、同じ発話の「ここまでの全文」を何度も出す。
+        # 出力側 (チャットボックス・オーバーレイ・ログ) はこのキーで同じ発話だと
+        # 分かり、新しい項目を積む代わりに前の版を置き換える。
+        stream_key = (spec.kind, phrase_id) if phrase_id is not None else None
 
         translation: list = []
         if config.ENABLE_TRANSLATION is False:
@@ -1146,7 +1149,7 @@ class Controller:
                         osc_translation, osc_original = translation, ""
                 else:
                     osc_translation, osc_original = translation, message
-                self._sendChatboxMessage(spec.osc_format_type, osc_translation, osc_original)
+                self._sendChatboxMessage(spec.osc_format_type, osc_translation, osc_original, key=stream_key)
 
             if spec.overlay_small_log and config.OVERLAY_SMALL_LOG is True and self._is_overlay_available():
                 if config.OVERLAY_SHOW_ONLY_TRANSLATED_MESSAGES is True:
@@ -3355,8 +3358,8 @@ class Controller:
     def setDisableSplitLongChatboxMessages(*args, **kwargs) -> dict:
         if config.SPLIT_LONG_CHATBOX_MESSAGES is True:
             config.SPLIT_LONG_CHATBOX_MESSAGES = False
-            # Pages of a message that is already being shown would otherwise keep coming.
-            model.oscCancelPendingPages()
+            # Messages and pages that are still queued would otherwise keep coming.
+            model.oscClearMessageQueue()
         return {"status":200, "result":config.SPLIT_LONG_CHATBOX_MESSAGES}
 
 
@@ -3466,7 +3469,7 @@ class Controller:
     def setDisableSendMessageToVrc(*args, **kwargs) -> dict:
         if config.SEND_MESSAGE_TO_VRC is True:
             config.SEND_MESSAGE_TO_VRC = False
-            model.oscCancelPendingPages()
+            model.oscClearMessageQueue()
         return {"status":200, "result":config.SEND_MESSAGE_TO_VRC}
 
 
@@ -3480,7 +3483,7 @@ class Controller:
     def setDisableSendReceivedMessageToVrc(*args, **kwargs) -> dict:
         if config.SEND_RECEIVED_MESSAGE_TO_VRC is True:
             config.SEND_RECEIVED_MESSAGE_TO_VRC = False
-            model.oscCancelPendingPages()
+            model.oscClearMessageQueue()
         return {"status":200, "result":config.SEND_RECEIVED_MESSAGE_TO_VRC}
 
 
@@ -3732,27 +3735,29 @@ class Controller:
             osc_message = message_part
         return osc_message
 
-    def _sendChatboxMessage(self, format_type: str, translation: list, message: str) -> None:
+    def _sendChatboxMessage(self, format_type: str, translation: list, message: str, key=None) -> None:
         """Send one message to the VRChat chatbox.
 
-        VRChat shows at most 144 characters and drops the rest. With the
-        default format the original comes first, so what gets cut is the end
-        of the translation. A message over the limit is split into pages,
-        each rendered with the user's format and sent one after another.
+        The chatbox shows a single message of at most 144 characters, and a
+        new one replaces it at once. Sent as they are produced, messages are
+        replaced before they can be read and the end of long ones (with the
+        default format: the end of the translation) is cut off. So they are
+        handed to the chatbox player, which shows them one after another,
+        page by page, each long enough to be read.
+
+        key: identifies the utterance for results of the transcription, which
+        sends longer and longer versions of what is still being said. The
+        player continues the version on screen instead of starting over.
         """
         if config.SPLIT_LONG_CHATBOX_MESSAGES is not True:
             model.oscSendMessage(self.messageFormatter(format_type, translation, message))
             return
-        pages = buildChatboxPages(
+        model.oscPlayMessage(
             message,
             translation,
             lambda page_translation, page_message: self.messageFormatter(format_type, page_translation, page_message),
+            key=key,
         )
-        if len(pages) == 1:
-            model.oscSendMessage(pages[0])
-        else:
-            printLog(f"[chatbox] message over the VRChat limit, sending {len(pages)} pages")
-            model.oscSendMessagePages(pages)
 
     def changeToCTranslate2Process(self) -> None:
         selected_engines = config.SELECTED_TRANSLATION_ENGINES[config.SELECTED_TAB_NO]

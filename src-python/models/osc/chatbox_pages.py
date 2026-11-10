@@ -1,34 +1,49 @@
-"""Split a chatbox message that exceeds VRChat's limit into pages.
+"""Pages for chatbox messages that exceed VRChat's limit.
 
 VRChat shows at most 144 characters of a chatbox message and silently drops
-the rest. With the default format ("message\\ntranslation")
-the part that gets cut is the end of the translation - the part the listener
-needs. An utterance of about 5 seconds is already enough to hit the limit.
+the rest. With the default format ("message\ntranslation") the part that gets
+cut is the end of the translation - the part the listener needs. An utterance
+of about 5 seconds is already enough to hit the limit.
 
-Instead of letting VRChat cut the text, the message and each translation are
-split into the same number of parts, and every page is rendered with the
-user's own message format, so each page still shows the original together
-with its translation. When the original and all translations have the same
-number of sentences, pages are cut on the same sentence boundaries so the
-parts on a page correspond to each other.
+Instead of letting VRChat cut the text, a long message is shown page by page.
+Every page is rendered with the user's own message format and holds the next
+part of the original together with the next part of each translation.
+
+Pages are filled front to back. Transcription keeps sending longer versions
+of the utterance that is still being spoken, and filling front to back means
+a page that is full does not change when more text arrives: new text only
+ever lands on the last page. (Balancing the pages instead would move every
+page boundary each time the text grows.)
+
+Where a page ends, in order of preference:
+1. after the same number of whole sentences in the original and in every
+   translation, so the lines of a page say the same thing;
+2. otherwise each text gets a share of the page in proportion to its length
+   and is cut at the last sentence end, clause end or space inside its share
+   (anywhere for text without spaces, such as Japanese).
+
+`ChatboxPlayer` (chatbox_player.py) decides when each page is shown.
 """
 
 import re
-from typing import Callable, List, Optional, Sequence
+from typing import Callable, List, Optional, Sequence, Tuple
 
 CHATBOX_MAX_CHARS = 144
-# More pages than this would keep the chatbox busy for too long. A message
-# that still does not fit is cut into fixed-size pieces instead (see
-# `_hardSplit`), so nothing is ever lost.
+# How many pages ahead are laid out at a time.
 CHATBOX_MAX_PAGES = 8
+# Room kept for the " (12/15)" marker on the pages of a message that needs
+# more than one.
+_MARKER_RESERVE = 8
 
-# Sentence end: ASCII terminators need a following space (so "3.5" and "a.m"
-# stay whole), full-width ones do not.
+# Sentence end: ASCII terminators need a following space or the end of the
+# text (so "3.5" and "a.m" stay whole), full-width ones do not.
 _SENTENCE_END_RE = re.compile(
-    r"(?:[.!?…]+[\"'’”)\]]*(?=\s)|[。！？．]+[」』）)\"'”]*)"
+    r"(?:[.!?…]+[\"'’”)\]]*(?=\s|$)|[。！？．]+[」』）)\"'”]*)"
 )
 _CLAUSE_END_RE = re.compile(r"(?:[,;:]+(?=\s)|[、，；：]+)")
 _SPACE_RE = re.compile(r"\s+")
+
+Render = Callable[[List[str], str], str]
 
 
 def chatboxLength(text: str) -> int:
@@ -36,158 +51,166 @@ def chatboxLength(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-def _splitSentences(text: str) -> List[str]:
-    sentences: List[str] = []
-    start = 0
-    for m in _SENTENCE_END_RE.finditer(text):
-        piece = text[start:m.end()].strip()
-        if piece:
-            sentences.append(piece)
-        start = m.end()
-    tail = text[start:].strip()
-    if tail:
-        sentences.append(tail)
-    return sentences
+def _renderParts(render: Render, parts: Sequence[str]) -> str:
+    """Render a page from [message, *translations], leaving out empty translations."""
+    return render([part for part in parts[1:] if part], parts[0])
 
 
-def _joinSentences(sentences: Sequence[str]) -> str:
-    result = ""
-    for sentence in sentences:
-        if result and not re.search(r"[。！？．」』）、，]$", result):
-            result += " "
-        result += sentence
-    return result
+def _prefixCut(text: str, share: int) -> int:
+    """How many characters of `text` to put on a page that has room for
+    `share` of them: up to the last sentence end, clause end or space."""
+    if len(text) <= share:
+        return len(text)
+    if share <= 0:
+        return 0
+    # A sentence end is worth giving up more of the page for than a space is.
+    for pattern, least in ((_SENTENCE_END_RE, 0.3), (_CLAUSE_END_RE, 0.4), (_SPACE_RE, 0.6)):
+        low = int(share * least)
+        ends = [m.end() for m in pattern.finditer(text, 0, share + 1) if low < m.end() <= share]
+        if ends:
+            return ends[-1]
+    return share
 
 
-def _bestCut(text: str, start: int, target: int) -> int:
-    """Index near `target` to cut `text[start:]` at: after the end of a
-    sentence if there is one nearby, else after a clause, else at a space,
-    else exactly at `target` (text without spaces, e.g. Japanese)."""
-    remaining = len(text) - start
-    window = max(6, (target - start) // 3)
-    low = max(start + 1, target - window)
-    high = min(len(text) - 1, target + window)
-    if low > high or remaining <= 1:
-        return min(max(target, start + 1), len(text))
-    for pattern in (_SENTENCE_END_RE, _CLAUSE_END_RE, _SPACE_RE):
-        candidates = [m.end() for m in pattern.finditer(text, start) if low <= m.end() <= high]
-        if candidates:
-            return min(candidates, key=lambda index: abs(index - target))
-    return min(max(target, low), high)
+def _sentenceEnds(text: str) -> List[int]:
+    """Index just past each complete sentence of `text`."""
+    return [m.end() for m in _SENTENCE_END_RE.finditer(text)]
 
 
-def splitText(text: str, parts: int) -> List[str]:
-    """Split `text` into `parts` pieces of similar length at natural
-    boundaries. Pieces can be empty when the text is too short to split."""
-    text = text.strip()
-    if parts <= 1:
-        return [text]
-    if len(text) < parts * 2:
-        return [text] + [""] * (parts - 1)
-    pieces: List[str] = []
-    start = 0
-    for index in range(parts - 1):
-        target = start + round((len(text) - start) / (parts - index))
-        cut = _bestCut(text, start, target)
-        pieces.append(text[start:cut].strip())
-        start = cut
-    pieces.append(text[start:].strip())
-    return pieces
-
-
-def _splitAligned(texts: Sequence[str], parts: int) -> Optional[List[List[str]]]:
-    """Split every text on the same sentence boundaries.
-
-    Only possible when all texts have the same number of sentences (which is
-    how a sentence-by-sentence translation usually comes back). Returns one
-    list of `parts` pieces per text, or None.
-    """
-    sentence_lists = [_splitSentences(text) for text in texts]
-    count = len(sentence_lists[0])
-    if count < parts or any(len(sentences) != count for sentences in sentence_lists):
+def _takeAlignedSentences(
+    texts: Sequence[str],
+    active: Sequence[int],
+    render: Render,
+    limit: int,
+) -> Optional[Tuple[str, List[int]]]:
+    """A page made of the first k sentences of every text, for the largest k
+    that fits - so the page ends where a sentence ends in the original and in
+    each translation alike. None when that would leave the page mostly empty
+    (the next sentence is too long to fit) or the texts have no sentence ends."""
+    ends = [_sentenceEnds(texts[i]) for i in active]
+    count = min(len(e) for e in ends)
+    best: Optional[Tuple[str, List[int]]] = None
+    for k in range(1, count + 1):
+        used = [0] * len(texts)
+        for i, e in zip(active, ends):
+            used[i] = e[k - 1]
+        parts = [texts[i][:used[i]].strip() for i in range(len(texts))]
+        page = _renderParts(render, parts)
+        if chatboxLength(page) > limit:
+            break
+        best = (page, used)
+    if best is None or chatboxLength(best[0]) < limit // 3:
         return None
-    # Combined length of sentence i across all texts: pages are balanced on
-    # what actually has to fit on them.
-    weights = [sum(len(sentences[i]) for sentences in sentence_lists) for i in range(count)]
-    cumulative = [0]
-    for weight in weights:
-        cumulative.append(cumulative[-1] + weight)
-    boundaries: List[int] = []
-    previous = 0
-    for part in range(1, parts):
-        target = cumulative[-1] * part / parts
-        # At least one sentence on this page and on each remaining page.
-        candidates = range(previous + 1, count - (parts - part) + 1)
-        previous = min(candidates, key=lambda index: abs(cumulative[index] - target))
-        boundaries.append(previous)
-    boundaries.append(count)
-    result: List[List[str]] = []
-    for sentences in sentence_lists:
-        pieces = []
-        begin = 0
-        for end in boundaries:
-            pieces.append(_joinSentences(sentences[begin:end]))
-            begin = end
-        result.append(pieces)
-    return result
+    return best
 
 
-def _hardSplit(text: str, limit: int) -> List[str]:
-    pages: List[str] = []
-    current = ""
-    for char in text:
-        if chatboxLength(current + char) > limit:
-            pages.append(current)
-            current = ""
-        current += char
-    if current:
-        pages.append(current)
-    return [page.strip() for page in pages if page.strip()]
+def _takeStreamPage(
+    texts: Sequence[str],
+    weights: Sequence[int],
+    render: Render,
+    limit: int,
+) -> Tuple[str, List[int]]:
+    """One page from the front of `texts` ([message, *translations]).
+
+    Each text gets a share of the page in proportion to `weights` (the full
+    length of that text), so the original and its translations advance
+    together. Returns the rendered page and the characters used of each text.
+    """
+    active = [i for i, text in enumerate(texts) if text]
+    whole = _renderParts(render, texts)
+    if chatboxLength(whole) <= limit:
+        return whole, [len(text) for text in texts]
+    aligned = _takeAlignedSentences(texts, active, render, limit)
+    if aligned is not None:
+        return aligned
+    overhead = chatboxLength(render(["x" for text in texts[1:] if text], "x" if texts[0] else "")) - len(active)
+    budget = float(max(len(active), limit - overhead))
+    for _ in range(40):
+        used = [0] * len(texts)
+        # A text that is short anyway goes on this page whole ("はい" with a
+        # long translation must not become "は" and "い" on two pages). The
+        # others share what is left.
+        small = budget / (2 * len(active))
+        whole_texts = [i for i in active if len(texts[i]) <= small]
+        sharing = [i for i in active if i not in whole_texts]
+        for i in whole_texts:
+            used[i] = len(texts[i])
+        room = budget - sum(used)
+        sharing_weight = sum(max(1, weights[i]) for i in sharing)
+        for i in sharing:
+            share = max(1, int(room * max(1, weights[i]) / sharing_weight))
+            used[i] = _prefixCut(texts[i], share)
+        parts = [texts[i][:used[i]].strip() for i in range(len(texts))]
+        page = _renderParts(render, parts)
+        if chatboxLength(page) <= limit and any(used):
+            return page, used
+        budget *= 0.9
+        if budget < len(active):
+            break
+    # The format leaves no room to share a page: one text at a time.
+    first = active[0]
+    used = [0] * len(texts)
+    used[first] = 1
+    while used[first] < len(texts[first]):
+        parts = [texts[i][:used[i] + (1 if i == first else 0)] for i in range(len(texts))]
+        if chatboxLength(_renderParts(render, parts)) > limit:
+            break
+        used[first] += 1
+    parts = [texts[i][:used[i]] for i in range(len(texts))]
+    return _renderParts(render, parts), used
 
 
-def buildChatboxPages(
-    message: str,
-    translation: Sequence[str],
-    render: Callable[[List[str], str], str],
+def buildStreamPages(
+    texts: Sequence[str],
+    offsets: Sequence[int],
+    completed: int,
+    render: Render,
     limit: int = CHATBOX_MAX_CHARS,
     max_pages: int = CHATBOX_MAX_PAGES,
-) -> List[str]:
-    """Return the chatbox pages for one message.
+) -> List[Tuple[str, List[int]]]:
+    """Pages for the part of a message that has not been shown yet.
 
-    `render(translation, message)` formats one page (the controller passes
-    its message formatter, so prefixes/suffixes/separators/order follow the
-    user's settings). A message that fits is returned as a single page,
-    exactly as `render` produced it. Pages of a split message end with a
-    " (1/3)" style marker so readers know more is coming.
+    `texts` is [message, *translations]; `offsets` says how many characters
+    of each have already been shown on the `completed` pages that came
+    before ([0, ...] and 0 for a message nobody has seen yet). Returns
+    (page, characters of each text on it) from the page that should be on
+    screen now onwards, at most `max_pages` of them.
+
+    A message that fits is a single page, exactly as `render` produced it.
+    Pages of a longer message end with a " (3/5)" marker.
     """
-    translation = list(translation)
-    full = render(translation, message)
-    if chatboxLength(full) <= limit:
-        return [full]
+    remaining = []
+    skipped = []
+    for text, offset in zip(texts, offsets):
+        rest = text[offset:]
+        stripped = rest.lstrip()
+        skipped.append(len(rest) - len(stripped))
+        remaining.append(stripped.rstrip())
+    if not any(remaining):
+        return []
+    weights = [len(text.strip()) for text in texts]
 
-    texts = [message] + translation
-    for parts in range(2, max_pages + 1):
-        marker_length = len(f" ({parts}/{parts})")
-        for split in (_splitAligned(texts, parts), [splitText(text, parts) for text in texts]):
-            if split is None:
-                continue
-            pages = []
-            for page_index in range(parts):
-                page_message = split[0][page_index]
-                page_translation = [pieces[page_index] for pieces in split[1:] if pieces[page_index]]
-                if not page_message and not page_translation:
-                    continue
-                pages.append(render(page_translation, page_message))
-            if len(pages) > 1 and all(chatboxLength(page) <= limit - marker_length for page in pages):
-                return [f"{page} ({index}/{len(pages)})" for index, page in enumerate(pages, start=1)]
+    if completed == 0:
+        whole = _renderParts(render, remaining)
+        if chatboxLength(whole) <= limit:
+            return [(whole, [len(text) - offset for text, offset in zip(texts, offsets)])]
 
-    # The format itself (long prefixes/separators) or a huge message leaves
-    # no way to fit whole parts: cut the rendered text into fixed-size pieces.
-    marker_length = len(f" ({max_pages}/{max_pages})")
-    pieces = _hardSplit(full, limit - marker_length)
-    if len(pieces) <= 1:
-        return pieces or [full]
-    if len(pieces) > max_pages:
-        pieces = pieces[:max_pages]
-        pieces[-1] = pieces[-1][:-1].rstrip() + "…"
-    return [f"{piece} ({index}/{len(pieces)})" for index, piece in enumerate(pieces, start=1)]
+    pages: List[Tuple[str, List[int]]] = []
+    current = list(remaining)
+    lead = list(skipped)
+    while any(current) and len(pages) < max_pages:
+        page, used = _takeStreamPage(current, weights, render, limit - _MARKER_RESERVE)
+        consumed = []
+        for i, count in enumerate(used):
+            rest = current[i][count:]
+            stripped = rest.lstrip()
+            # Whitespace around a cut belongs to the page that ends there.
+            consumed.append(lead[i] + count + (len(rest) - len(stripped)))
+            current[i] = stripped
+            lead[i] = 0
+        pages.append((page, consumed))
+    total = completed + len(pages)
+    return [
+        (f"{page} ({completed + index}/{total})", consumed)
+        for index, (page, consumed) in enumerate(pages, start=1)
+    ]

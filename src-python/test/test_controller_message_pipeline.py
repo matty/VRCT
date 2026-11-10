@@ -119,7 +119,7 @@ class _MessagePipelineTestBase(unittest.TestCase):
             ("detectVRAMError", MagicMock(return_value=(False, ""))),
             ("convertMessageToTransliteration", MagicMock(return_value=["TRANSLITERATED"])),
             ("oscSendMessage", MagicMock()),
-            ("oscSendMessagePages", MagicMock()),
+            ("oscPlayMessage", MagicMock()),
             ("createOverlayImageLargeLog", MagicMock(return_value="LARGE_IMG")),
             ("createOverlayImageSmallLog", MagicMock(return_value="SMALL_IMG")),
             ("updateOverlayLargeLog", MagicMock()),
@@ -132,6 +132,14 @@ class _MessagePipelineTestBase(unittest.TestCase):
         ):
             self._model_patches[name] = getattr(self._model, name, None)
             setattr(self._model, name, value)
+
+        # チャットボックスへは再生キュー (ChatboxPlayer) 経由で送る。ここでは
+        # 「キューが空ですぐ表示された」場合と同じく、組み立てた文字列を
+        # oscSendMessage に渡す。既存のテストは、チャットボックスに出る文字列を
+        # これまでどおり oscSendMessage で確かめられる。
+        self._model.oscPlayMessage.side_effect = (
+            lambda message, translation, render, key=None: self._model.oscSendMessage(render(translation, message))
+        )
 
     def tearDown(self) -> None:
         for k, v in self._saved.items():
@@ -309,47 +317,66 @@ class TestMicMessage(_MessagePipelineTestBase):
         self.controller.speakerMessage({"text": "hello", "language": "English", "phrase_id": 13})
         self._model.addTranslationHistory.assert_called_once_with("speaker", "hello", phrase_id=13)
 
-    def test_osc_message_over_the_vrchat_limit_is_sent_as_pages(self) -> None:
-        # VRChat は144文字で切り捨てる。既定の書式では原文が先なので、切れるのは
-        # 訳文の後半になる。分割して全部届ける。
-        message = "This is the first sentence of a long message. " * 3
-        translation = "これは長いメッセージの最初の文です。" * 3
-        self._model.getInputTranslate.return_value = ([translation], [True])
-        self.controller.micMessage({"text": message.strip(), "language": "English"})
-        self._model.oscSendMessage.assert_not_called()
-        self._model.oscSendMessagePages.assert_called_once()
-        pages = self._model.oscSendMessagePages.call_args.args[0]
-        self.assertGreater(len(pages), 1)
-        for page in pages:
-            self.assertLessEqual(len(page), 144)
-            original, translated = page.split("\n")
-            self.assertTrue(original.startswith("This is the first sentence"))
-            self.assertTrue(translated.startswith("これは長いメッセージ"))
-        self.assertEqual("".join(pages).count("これは長いメッセージの最初の文です。"), 3)
+    def test_osc_message_is_handed_to_the_chatbox_player_unformatted(self) -> None:
+        # 分割・順番待ち・表示時間は再生キュー側の仕事。原文と訳文を別々に渡し、
+        # ページごとに書式を当てられるよう、書式は関数で渡す。
+        self._model.getInputTranslate.return_value = (["hola"], [True])
+        self.controller.micMessage({"text": "hello", "language": "English", "phrase_id": 7})
+        self._model.oscPlayMessage.assert_called_once()
+        args, kwargs = self._model.oscPlayMessage.call_args
+        self.assertEqual(args[0], "hello")
+        self.assertEqual(args[1], ["hola"])
+        self.assertEqual(args[2](["hola"], "hello"), "hello\nhola")
+        self.assertEqual(args[2](["ho"], ""), "ho")
+        self.assertEqual(kwargs["key"], ("mic", 7))
 
-    def test_osc_long_message_is_sent_whole_when_splitting_is_disabled(self) -> None:
+    def test_osc_results_of_the_same_utterance_share_a_key(self) -> None:
+        self._model.getInputTranslate.return_value = (["hola"], [True])
+        self.controller.micMessage({"text": "hello", "language": "English", "phrase_id": 7})
+        self.controller.micMessage({"text": "hello there", "language": "English", "phrase_id": 7})
+        self.controller.micMessage({"text": "bye", "language": "English", "phrase_id": 8})
+        keys = [call.kwargs["key"] for call in self._model.oscPlayMessage.call_args_list]
+        self.assertEqual(keys, [("mic", 7), ("mic", 7), ("mic", 8)])
+
+    def test_osc_speaker_and_mic_utterances_never_share_a_key(self) -> None:
+        self._model.getInputTranslate.return_value = (["hola"], [True])
+        self._model.getOutputTranslate.return_value = (["hola"], [True])
+        self.controller.micMessage({"text": "hello", "language": "English", "phrase_id": 7})
+        self.controller.speakerMessage({"text": "hello", "language": "English", "phrase_id": 7})
+        keys = [call.kwargs["key"] for call in self._model.oscPlayMessage.call_args_list]
+        self.assertEqual(keys, [("mic", 7), ("speaker", 7)])
+
+    def test_osc_typed_chat_has_no_key(self) -> None:
+        self._model.getInputTranslate.return_value = (["hola"], [True])
+        self.controller.chatMessage({"id": "abc", "message": "hello"})
+        self.assertIsNone(self._model.oscPlayMessage.call_args.kwargs["key"])
+
+    def test_osc_send_only_translated_passes_only_the_translation(self) -> None:
+        config.SEND_ONLY_TRANSLATED_MESSAGES = True
+        self._model.getInputTranslate.return_value = (["hola"], [True])
+        self.controller.micMessage({"text": "hello", "language": "English"})
+        args, _ = self._model.oscPlayMessage.call_args
+        self.assertEqual((args[0], args[1]), ("", ["hola"]))
+
+    def test_osc_message_is_sent_directly_when_the_player_is_disabled(self) -> None:
         config.SPLIT_LONG_CHATBOX_MESSAGES = False
         message = ("This is the first sentence of a long message. " * 3).strip()
         translation = "これは長いメッセージの最初の文です。" * 3
         self._model.getInputTranslate.return_value = ([translation], [True])
         self.controller.micMessage({"text": message, "language": "English"})
-        self._model.oscSendMessagePages.assert_not_called()
+        self._model.oscPlayMessage.assert_not_called()
         self._model.oscSendMessage.assert_called_once_with(f"{message}\n{translation}")
 
-    def test_osc_long_message_pages_use_the_send_format(self) -> None:
+    def test_osc_pages_use_the_send_format(self) -> None:
         parts = config.SEND_MESSAGE_FORMAT_PARTS
         parts["translation"]["prefix"] = "("
         parts["translation"]["suffix"] = ")"
         parts["translation_first"] = True
         config.SEND_MESSAGE_FORMAT_PARTS = parts
-        message = ("This is the first sentence of a long message. " * 3).strip()
-        translation = "これは長いメッセージの最初の文です。" * 3
-        self._model.getInputTranslate.return_value = ([translation], [True])
-        self.controller.micMessage({"text": message, "language": "English"})
-        pages = self._model.oscSendMessagePages.call_args.args[0]
-        for page in pages:
-            self.assertTrue(page.startswith("(これは長いメッセージ"), page)
-            self.assertIn(")\nThis is the first sentence", page)
+        self._model.getInputTranslate.return_value = (["hola"], [True])
+        self.controller.micMessage({"text": "hello", "language": "English"})
+        render = self._model.oscPlayMessage.call_args.args[2]
+        self.assertEqual(render(["ho"], "he"), "(ho)\nhe")
 
     def test_clipboard_copies_when_enabled(self) -> None:
         config.ENABLE_CLIPBOARD = True

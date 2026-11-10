@@ -353,8 +353,8 @@ config_page:
         send_only_translated_messages:
             label: "只发送翻译后的信息"
         split_long_chatbox_messages:
-            label: "拆分过长的聊天框消息"
-            desc: "VRChat 聊天框最多显示 144 个字符，超出的部分（通常是译文的后半段）会被截断。启用后，较长的消息会被拆分成多页，并带有 (1/2) 这样的标记，每页约 5 秒依次显示。"
+            label: "按顺序显示聊天框消息"
+            desc: "VRChat 聊天框只显示一条最多 144 个字符的消息，每条新消息都会替换它。启用后，消息会按顺序逐条显示，每条停留足够阅读的时间；较长的消息会带有 (1/2) 这样的标记分页显示。如果显示跟不上说话的速度，会跳过最早的未显示页面。禁用后，消息会立即发送，超出的部分由 VRChat 截断。"
         auto_export_message_logs:
             label: "自动导出聊天记录"
             desc: "以文本文件的形式在logs文件夹中保存。"

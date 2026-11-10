@@ -1,11 +1,17 @@
-"""OSCHandler: sending a chatbox message as pages, one after another."""
+"""OSCHandler: chatbox messages go through the player; direct sends still work."""
 
-import threading
 import time
 import unittest
 from unittest.mock import MagicMock
 
-from models.osc.osc import CHATBOX_PAGE_INTERVAL_SECONDS, OSCHandler
+from models.osc.osc import OSCHandler
+
+
+def _render(translation, message):
+    translation_part = "\n".join(translation)
+    if translation and message:
+        return message + "\n" + translation_part
+    return translation_part if translation else message
 
 
 def _handler():
@@ -14,11 +20,11 @@ def _handler():
     return handler
 
 
-def _sent(handler):
-    return [call.args[1] for call in handler.udp_client.send_message.call_args_list]
+def _sent(client):
+    return [call.args[1] for call in client.send_message.call_args_list]
 
 
-def _wait_for(predicate, timeout=2.0):
+def _wait_for(predicate, timeout=3.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if predicate():
@@ -28,7 +34,7 @@ def _wait_for(predicate, timeout=2.0):
 
 
 class SendMessageTests(unittest.TestCase):
-    def test_single_message_is_sent_as_before(self):
+    def test_direct_send_goes_out_immediately(self):
         handler = _handler()
         handler.sendMessage("hello", notification=False)
         handler.udp_client.send_message.assert_called_once_with("/chatbox/input", ["hello", True, False])
@@ -38,89 +44,67 @@ class SendMessageTests(unittest.TestCase):
         handler.sendMessage("")
         handler.udp_client.send_message.assert_not_called()
 
-    def test_page_interval_stays_clear_of_vrchats_rate_limit(self):
-        self.assertGreaterEqual(CHATBOX_PAGE_INTERVAL_SECONDS, 2.0)
-
-
-class SendMessagePagesTests(unittest.TestCase):
-    def test_first_page_is_sent_immediately(self):
+    def test_direct_send_drops_what_the_player_had_queued(self):
         handler = _handler()
-        handler.sendMessagePages(["one", "two"], notification=True, interval=30)
-        self.assertEqual(_sent(handler), [["one", True, True]])
-        handler.cancelPendingPages()
+        try:
+            handler.playMessage("first", [], _render)
+            handler.playMessage("second", [], _render)
+            self.assertTrue(_wait_for(lambda: len(_sent(handler.udp_client)) == 1))
+            handler.sendMessage("direct")
+            time.sleep(0.2)
+            self.assertEqual([args[0] for args in _sent(handler.udp_client)], ["first", "direct"])
+            self.assertEqual(handler.chatbox_player.pendingPages(), 0)
+        finally:
+            handler.chatbox_player.stop()
 
-    def test_following_pages_are_sent_in_order_without_the_notification_sound(self):
-        handler = _handler()
-        handler.sendMessagePages(["one", "two", "three"], notification=True, interval=0.02)
-        self.assertTrue(_wait_for(lambda: len(_sent(handler)) == 3))
-        self.assertEqual(
-            _sent(handler),
-            [["one", True, True], ["two", True, False], ["three", True, False]],
-        )
 
-    def test_pages_wait_for_the_interval(self):
+class PlayMessageTests(unittest.TestCase):
+    def test_played_message_reaches_the_chatbox(self):
         handler = _handler()
-        handler.sendMessagePages(["one", "two"], interval=0.2)
-        time.sleep(0.05)
-        self.assertEqual(len(_sent(handler)), 1)
-        self.assertTrue(_wait_for(lambda: len(_sent(handler)) == 2))
-
-    def test_a_new_message_drops_the_pages_still_waiting(self):
-        handler = _handler()
-        handler.sendMessagePages(["one", "two", "three"], interval=0.1)
-        handler.sendMessage("new")
-        time.sleep(0.3)
-        self.assertEqual([args[0] for args in _sent(handler)], ["one", "new"])
-
-    def test_a_new_paged_message_replaces_the_old_one(self):
-        handler = _handler()
-        handler.sendMessagePages(["a1", "a2", "a3"], interval=0.1)
-        handler.sendMessagePages(["b1", "b2"], interval=0.02)
-        self.assertTrue(_wait_for(lambda: len(_sent(handler)) == 3))
-        time.sleep(0.25)
-        self.assertEqual([args[0] for args in _sent(handler)], ["a1", "b1", "b2"])
-
-    def test_cancel_drops_the_pages_still_waiting(self):
-        handler = _handler()
-        handler.sendMessagePages(["one", "two"], interval=0.05)
-        handler.cancelPendingPages()
-        time.sleep(0.15)
-        self.assertEqual([args[0] for args in _sent(handler)], ["one"])
-
-    def test_empty_pages_are_skipped(self):
-        handler = _handler()
-        handler.sendMessagePages(["", "one", ""], interval=0.02)
-        time.sleep(0.1)
-        self.assertEqual([args[0] for args in _sent(handler)], ["one"])
-
-    def test_no_pages_sends_nothing(self):
-        handler = _handler()
-        handler.sendMessagePages([])
-        handler.udp_client.send_message.assert_not_called()
+        try:
+            handler.playMessage("hello", ["hola"], _render, key=("mic", 1), notification=True)
+            self.assertTrue(_wait_for(lambda: len(_sent(handler.udp_client)) == 1))
+            self.assertEqual(_sent(handler.udp_client), [["hello\nhola", True, True]])
+        finally:
+            handler.chatbox_player.stop()
 
     def test_the_caller_is_not_blocked(self):
         handler = _handler()
-        started = time.monotonic()
-        handler.sendMessagePages(["one", "two", "three"], interval=30)
-        self.assertLess(time.monotonic() - started, 0.5)
-        handler.cancelPendingPages()
+        try:
+            started = time.monotonic()
+            for i in range(10):
+                handler.playMessage(f"message {i}", [], _render)
+            self.assertLess(time.monotonic() - started, 0.5)
+        finally:
+            handler.chatbox_player.stop()
+
+    def test_clear_drops_the_messages_still_waiting(self):
+        handler = _handler()
+        try:
+            handler.playMessage("one", [], _render)
+            handler.playMessage("two", [], _render)
+            self.assertTrue(_wait_for(lambda: len(_sent(handler.udp_client)) == 1))
+            handler.clearMessageQueue()
+            self.assertEqual(handler.chatbox_player.pendingPages(), 0)
+        finally:
+            handler.chatbox_player.stop()
 
     def test_pages_follow_a_changed_osc_target(self):
-        # setOscIpAddress/setOscPort replace udp_client: later pages must go
-        # to the new target, not the client captured when sending started.
+        # setOscIpAddress/setOscPort replace udp_client: what is still queued
+        # must go to the new target, not the client in use when it was queued.
         handler = _handler()
-        handler.sendMessagePages(["one", "two"], interval=0.05)
-        new_client = MagicMock()
-        handler.udp_client = new_client
-        self.assertTrue(_wait_for(lambda: new_client.send_message.call_count == 1))
-        new_client.send_message.assert_called_once_with("/chatbox/input", ["two", True, False])
-
-    def test_page_threads_end(self):
-        handler = _handler()
-        before = threading.active_count()
-        handler.sendMessagePages(["one", "two"], interval=0.01)
-        self.assertTrue(_wait_for(lambda: len(_sent(handler)) == 2))
-        self.assertTrue(_wait_for(lambda: threading.active_count() <= before))
+        try:
+            old_client = handler.udp_client
+            handler.playMessage("one", [], _render)
+            handler.playMessage("two", [], _render)
+            self.assertTrue(_wait_for(lambda: old_client.send_message.call_count == 1))
+            new_client = MagicMock()
+            handler.udp_client = new_client
+            self.assertTrue(_wait_for(lambda: new_client.send_message.call_count == 1, timeout=6.0))
+            new_client.send_message.assert_called_once_with("/chatbox/input", ["two", True, True])
+            self.assertEqual(old_client.send_message.call_count, 1)
+        finally:
+            handler.chatbox_player.stop()
 
 
 if __name__ == "__main__":

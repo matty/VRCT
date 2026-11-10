@@ -1695,14 +1695,16 @@ class Model:
         self.ensure_initialized()
         self.osc_handler.sendMessage(message=message, notification=config.NOTIFICATION_VRC_SFX)
 
-    def oscSendMessagePages(self, pages: list):
-        """Send a chatbox message split into pages (models/osc/chatbox_pages.py)."""
+    def oscPlayMessage(self, message: str, translation: list, render: Callable[[list, str], str], key=None):
+        """Queue a chatbox message to be played through in order (models/osc/chatbox_player.py)."""
         self.ensure_initialized()
-        self.osc_handler.sendMessagePages(pages, notification=config.NOTIFICATION_VRC_SFX)
+        self.osc_handler.playMessage(
+            message, translation, render, key=key, notification=config.NOTIFICATION_VRC_SFX
+        )
 
-    def oscCancelPendingPages(self):
+    def oscClearMessageQueue(self):
         self.ensure_initialized()
-        self.osc_handler.cancelPendingPages()
+        self.osc_handler.clearMessageQueue()
 
     def setMuteSelfStatus(self):
         self.ensure_initialized()

@@ -245,7 +245,7 @@ _debounce_time: int = 2  # デバウンス時間（秒）
 - `USE_EXCLUDE_WORDS`: 除外ワード機能使用フラグ
 - `AUTO_CLEAR_MESSAGE_BOX`: メッセージボックス自動クリア
 - `SEND_ONLY_TRANSLATED_MESSAGES`: 翻訳メッセージのみ送信
-- `SPLIT_LONG_CHATBOX_MESSAGES`: VRChat の上限 (144 文字) を超えるチャットボックスのメッセージを複数ページに分けて送信 (既定 True)
+- `SPLIT_LONG_CHATBOX_MESSAGES`: チャットボックスのメッセージを順番待ちにして、読める時間ずつ、長いものはページごとに表示する (既定 True)。オフならすぐに 1 通で送信
 - `SEND_MESSAGE_TO_VRC`: VRChatへメッセージ送信
 - `SEND_RECEIVED_MESSAGE_TO_VRC`: 受信メッセージをVRChatへ送信
 - `LOGGER_FEATURE`: ロガー機能有効
