@@ -124,9 +124,13 @@ class TranscriberPhraseIdTests(unittest.TestCase):
         # Longer than phrase_timeout (3 s) after the previous chunk.
         audio_queue.put((b"\x02\x00", now + timedelta(seconds=10)))
         transcriber.transcribeAudioQueue(audio_queue, ["Japanese"], ["Japan"])
-        second = transcriber.getTranscript()["phrase_id"]
+        results = []
+        while transcriber.hasTranscript():
+            results.append(transcriber.getTranscript())
+        second = [r["phrase_id"] for r in results if r["text"]]
 
-        self.assertNotEqual(first, second)
+        self.assertEqual(len(second), 1)
+        self.assertNotEqual(first, second[0])
 
     def test_vad_fragments_share_an_id_until_the_utterance_ends(self, _):
         transcriber = self._transcriber(vad_segmented=True)

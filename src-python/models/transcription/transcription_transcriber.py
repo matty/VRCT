@@ -65,6 +65,16 @@ GOOGLE_RECOGNIZE_TIMEOUT_SECONDS = 10
 # self.phrase_timeout とは独立した固定値にしている。
 MAX_PHRASE_DURATION_SECONDS = 15
 
+# 上限に達した発話の切り方。以前は届いたチャンクの終わり (= 録音側が record_timeout
+# で機械的に切った位置。単語の途中のことが多い) でそのまま確定し、次の発話は
+# 空のバッファから始めていた。切れ目の単語は前後どちらの文字起こしでも欠ける。
+# バッファの末尾 _CARRY_SEARCH_SECONDS 秒の中でいちばん静かな位置 (語の切れ目で
+# あることが多い) で切り、そこから後ろは捨てずに次の発話の先頭へ持ち越す。
+# 話し続けていても、音声はどこかの発話に必ず 1 回だけ含まれる。
+# 評価: docs/streaming_output_2026-11-10.md
+_CARRY_SEARCH_SECONDS = 3.0
+_CARRY_WINDOW_SECONDS = 0.1
+
 # VAD方式 (config.MIC_ENABLE_VAD/SPEAKER_ENABLE_VAD) で確定したクリップの前後に付与する無音
 # (ゼロバイト) パディング。2026-09-07: Google (無料/非公式エンドポイント)
 # で「ネットワークエラーは無いのに認識結果が0件で返る」
@@ -157,6 +167,19 @@ class AudioTranscriber:
         self.near_gate: Optional[NearVoiceGate] = NearVoiceGate() if near_voice_only else None
         self.near_voice_skips = 0
         self._phrase_id = next(_PHRASE_IDS)
+        # 今の発話 (phrase_id) の結果を 1 件でも出したか。出していれば、発話を
+        # 閉じるときに受け取る側へ「この発話はここまで」を必ず伝える。
+        self._phrase_emitted = False
+        # 直近の _finalizeAndTranscribe がテキストを出したか。
+        self._last_send_emitted = False
+        # last_sample に、まだ一度も文字起こしに送っていない音声があるか。
+        # 以前は transcribeAudioQueue のローカル変数だった (戻る時点では必ず
+        # 送信済みだった)。上限で切った残りを次の発話へ持ち越すようになり、
+        # 未送信のまま呼び出しをまたぐので、インスタンスで持つ。
+        self._unsent = False
+        # 未送信なのが「上限で切って持ち越した残り」だけか。短い切れ端なので
+        # 単独では送らず、続きの音声か発話の終わりを待つ。
+        self._carried_only = False
         self.transcript_data: List[Dict[str, Any]] = []
         self.transcript_changed_event = Event()
         self.last_recognition_error = False
@@ -304,15 +327,14 @@ class AudioTranscriber:
         """
         source_info = self.audio_sources
         transcribed = False
-        # last_sample に「まだ一度も送信していない追記」があるか。
+        # self._unsent: last_sample に「まだ一度も送信していない追記」があるか。
         # interim_send をキューのドレイン単位で1回に畳む
         # (下記参照) にあたり、reset_only() が前提にしている
         # 「この last_sample は直前に送信済み」が崩れるため、それを
         # 明示的に追跡して取りこぼしを防ぐ。
-        unsent = False
         kind = "speaker" if self.speaker else "mic"
 
-        def send_current_buffer() -> bool:
+        def send_current_buffer(final: bool = False) -> bool:
             # VAD確定時は last_sample のコピーにのみパディングを付与して
             # 送信し、蓄積用の last_sample 自体は無加工のまま維持する
             # (interim_send が後続チャンクをそのまま追記できるようにする
@@ -322,40 +344,69 @@ class AudioTranscriber:
                 return False
             if self.vad_segmented:
                 source_info["last_sample"] = self._padWithSilenceForVad(original)
+            self._last_send_emitted = False
             try:
                 return self._finalizeAndTranscribe(
-                    languages, countries, avg_logprob, no_speech_prob, no_repeat_ngram_size
+                    languages, countries, avg_logprob, no_speech_prob, no_repeat_ngram_size,
+                    final=final,
                 )
             finally:
                 source_info["last_sample"] = original
 
-        def finalize() -> None:
-            nonlocal transcribed, unsent
-            if send_current_buffer():
-                transcribed = True
+        def close_phrase() -> None:
+            # 次の発話のための状態リセット。この発話の結果を既に出していて、
+            # 最後の結果に final が付いていない (= 途中経過のまま終わった)
+            # ときは、受け取る側へ発話の終わりを知らせる空の結果を積む。
+            if self._phrase_emitted and not self._last_send_emitted:
+                self.updateTranscript({
+                    "confidence": 0, "text": "", "language": None,
+                    "phrase_id": self._phrase_id, "final": True,
+                })
             source_info["last_sample"] = bytes()
             source_info["phrase_started_at"] = None
             self._phrase_id = next(_PHRASE_IDS)
-            unsent = False
+            self._phrase_emitted = False
+            self._last_send_emitted = False
+            self._unsent = False
+            self._carried_only = False
+
+        def finalize() -> None:
+            nonlocal transcribed
+            if send_current_buffer(final=True):
+                transcribed = True
+            close_phrase()
 
         def interim_send() -> None:
             # finalize と異なり last_sample/phrase_started_at を
             # リセットしない。次のチャンクが来たら、今回よりさらに育った
             # 同じ発話の累積バッファを再送信することになる (v3.5.0 と同じ)。
-            nonlocal transcribed, unsent
+            nonlocal transcribed
             if send_current_buffer():
                 transcribed = True
-            unsent = False
+            self._unsent = False
 
         def reset_only() -> None:
             # interim_send() で直前に送信済みの内容を
             # もう一度 _finalizeAndTranscribe に通すと無駄な二重送信に
             # なるため、次のフレーズのための状態リセットだけ行う。
-            nonlocal unsent
-            source_info["last_sample"] = bytes()
-            source_info["phrase_started_at"] = None
-            self._phrase_id = next(_PHRASE_IDS)
-            unsent = False
+            # 発話の終わりの知らせ (close_phrase が積む) は、戻り値に関係なく
+            # 呼び出し元 (model.sendTranscript) が毎回 hasTranscript() で配信する。
+            self._last_send_emitted = False
+            close_phrase()
+
+        def cut_long_phrase() -> None:
+            # 上限に達した。静かな位置で切って前半を確定し、後半は次の発話の
+            # 先頭に持ち越す (_CARRY_SEARCH_SECONDS のコメント参照)。
+            data = source_info["last_sample"]
+            split = self._quietSplitOffset(data)
+            tail = data[split:]
+            source_info["last_sample"] = data[:split]
+            finalize()
+            if tail:
+                source_info["last_sample"] = tail
+                source_info["phrase_started_at"] = source_info["last_spoken"]
+                self._unsent = True
+                self._carried_only = True
 
         if self.vad_segmented:
             while True:
@@ -392,7 +443,7 @@ class AudioTranscriber:
                         f"[VAD-merge][{kind}] safety-net finalize reason={reason!r} "
                         f"accumulated={accumulated_sec:.2f}s bytes={len(source_info['last_sample'])}"
                     )
-                    finalize()
+                    cut_long_phrase()
                 elif audio_queue.empty():
                     # 非VAD経路と同じドレイン単位の畳み込み (下記ループの
                     # 同じ判定を参照)。キューに次の segment が控えている
@@ -441,7 +492,7 @@ class AudioTranscriber:
                 # ドレイン畳み込み (下記) で送信を飛ばしていた場合は
                 # 未送信のまま捨てることになるので、その時は送ってから
                 # リセットする。
-                if not unsent:
+                if not self._unsent:
                     reset_only()
                 else:
                     finalize()
@@ -451,7 +502,8 @@ class AudioTranscriber:
 
             source_info["last_sample"] += data
             source_info["last_spoken"] = time_spoken
-            unsent = True
+            self._unsent = True
+            self._carried_only = False
 
             # VAD 経路と同じく、蓄積されている音声そのものの長さで測る。
             # チャンクの到着時刻の差では、フレーズ最初のチャンクが含む音声
@@ -461,7 +513,7 @@ class AudioTranscriber:
             # 上の phrase_timeout 判定は「到着の間隔 = 無音ギャップ」を
             # 見るものなので、そちらは時刻のままで正しい。
             if _bufferedSeconds(source_info) >= MAX_PHRASE_DURATION_SECONDS:
-                finalize()
+                cut_long_phrase()
             elif audio_queue.empty():
                 # ドレイン単位で1回に畳む。interim_send() は「育っていく
                 # 累積バッファ」を毎回まるごと ASR に投げるため、キューに
@@ -495,14 +547,57 @@ class AudioTranscriber:
             # 通常は既に送信済み (末尾のチャンクが来た回のループで送られて
             # いる) なので、再送信せずリセットだけする。未送信で残って
             # いる場合だけ送ってからリセットする。
-            if not unsent:
+            if not self._unsent:
                 reset_only()
             else:
                 finalize()
+        elif (
+            not transcribed
+            and self._unsent
+            and not self._carried_only
+            and source_info["last_sample"]
+            and audio_queue.empty()
+        ):
+            # 前の呼び出しが、前の発話を確定した直後にこのチャンクを積んだまま
+            # 戻った (1 回の呼び出しで ASR は 1 回まで)。以前は「未送信」を
+            # 呼び出しごとに忘れていたので、このチャンクは次の無音ギャップで
+            # 一度も文字起こしされずに捨てられていた。
+            interim_send()
 
         if not transcribed:
             time.sleep(0.01)
         return transcribed
+
+    def _quietSplitOffset(self, data: bytes) -> int:
+        """`data` (蓄積バッファ) を切る位置のバイト数。末尾 _CARRY_SEARCH_SECONDS 秒の
+        中で、_CARRY_WINDOW_SECONDS 秒の窓のエネルギーが最も小さい位置。
+
+        切れない (16 bit 以外、短すぎる) ときは len(data) を返す (= 持ち越しなし)。
+        """
+        sample_rate = self.audio_sources["sample_rate"]
+        sample_width = self.audio_sources["sample_width"]
+        channels = self.audio_sources["channels"] or 1
+        frame_bytes = sample_width * channels
+        window = int(sample_rate * _CARRY_WINDOW_SECONDS)
+        search = int(sample_rate * _CARRY_SEARCH_SECONDS)
+        total_frames = len(data) // frame_bytes if frame_bytes else 0
+        if sample_width != 2 or window <= 0 or total_frames < search + window:
+            return len(data)
+        start_frame = total_frames - search
+        region = np.frombuffer(
+            data[start_frame * frame_bytes:total_frames * frame_bytes], dtype="<i2"
+        ).astype(np.float64)
+        if channels > 1:
+            region = region.reshape(-1, channels).mean(axis=1)
+        hop = max(1, window // 2)
+        # 窓ごとのエネルギー (二乗和)。累積和で一度に求める。
+        cumulative = np.concatenate(([0.0], np.cumsum(region * region)))
+        starts = np.arange(0, region.size - window + 1, hop)
+        energy = cumulative[starts + window] - cumulative[starts]
+        # 同じ静かさなら後ろを選ぶ (持ち越す量が少なくて済む)。
+        last_quietest = energy.size - 1 - int(np.argmin(energy[::-1]))
+        quietest = int(starts[last_quietest]) + window // 2
+        return (start_frame + quietest) * frame_bytes
 
     def _padWithSilenceForVad(self, data: bytes) -> bytes:
         """VAD が確定したクリップの前後に無音 (ゼロバイト) を付与する。
@@ -546,9 +641,13 @@ class AudioTranscriber:
         avg_logprob: float,
         no_speech_prob: float,
         no_repeat_ngram_size: int,
+        final: bool = False,
     ) -> bool:
         """確定した audio_sources['last_sample'] を実際に文字起こしする。
         last_sample のクリアは呼び出し元 (transcribeAudioQueue) が行う。
+
+        final: この発話の最後の結果か (この後バッファをリセットする)。結果に
+        `final` として載り、受け取る側が発話の終わりを知るのに使う。
         """
         # Google/API系はネットワーク経由のためエラーが一時的なことが多く、
         # 呼び出しの都度エラー状態をクリアして UI に古いエラーを残さない。
@@ -698,6 +797,9 @@ class AudioTranscriber:
             self.asr_successes += 1
             best["asr_ms"] = asr_elapsed_ms
             best["phrase_id"] = self._phrase_id
+            best["final"] = final
+            self._phrase_emitted = True
+            self._last_send_emitted = True
             self.updateTranscript(best)
         success_rate = (self.asr_successes / self.asr_attempts) * 100
         printLog(
@@ -765,3 +867,7 @@ class AudioTranscriber:
         self.audio_sources["last_spoken"] = None
         self.audio_sources["phrase_started_at"] = None
         self._phrase_id = next(_PHRASE_IDS)
+        self._phrase_emitted = False
+        self._last_send_emitted = False
+        self._unsent = False
+        self._carried_only = False

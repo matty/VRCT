@@ -235,7 +235,11 @@ class TestConfirmedCompleteTranscription(unittest.TestCase):
         # まとめて確定・送信される (chunk2 用に新フレーズを開始する
         # わけではない)。
         transcriber.whisper_model.transcribe.assert_called_once()
-        self.assertEqual(transcriber.audio_sources["last_sample"], b"")
+        # 上限で切った残り (静かな位置から後ろ) だけが、次の発話の先頭として残る。
+        self.assertLess(
+            len(transcriber.audio_sources["last_sample"]),
+            FakeAudioSource.SAMPLE_RATE * FakeAudioSource.SAMPLE_WIDTH * 3,
+        )
 
     @patch("models.transcription.transcription_transcriber.checkWhisperWeight", return_value=False)
     def test_trailing_timeout_finalizes_when_no_further_chunk_ever_arrives(self, _) -> None:
@@ -301,7 +305,14 @@ class TestConfirmedCompleteTranscription(unittest.TestCase):
         # 呼び出し元のループ相当。残りも取りこぼさず確定される。
         self.assertTrue(transcriber.transcribeAudioQueue(audio_queue, ["Japanese"], ["Japan"]))
 
-        self.assertEqual(transcriber.whisper_model.transcribe.call_count, 2)
+        # 3 つのチャンクがそれぞれ 1 回ずつ送られる。以前は「未送信」を呼び出し
+        # ごとに忘れていたので、2 つ目のチャンクは一度も文字起こしされずに
+        # 捨てられ、ASR は 3 発話に対して 2 回しか走っていなかった。
+        self.assertEqual(transcriber.whisper_model.transcribe.call_count, 3)
+        sent = [
+            call.args[0].tobytes() for call in transcriber.whisper_model.transcribe.call_args_list
+        ]
+        self.assertEqual(len(set(sent)), 3)
         self.assertEqual(transcriber.audio_sources["last_sample"], b"\x03\x00")
 
     @patch("models.transcription.transcription_transcriber.checkWhisperWeight", return_value=False)
@@ -436,7 +447,11 @@ class TestVadSegmentedTranscription(unittest.TestCase):
 
         self.assertTrue(result)
         transcriber.whisper_model.transcribe.assert_called_once()
-        self.assertEqual(transcriber.audio_sources["last_sample"], b"")
+        # 上限で切った残り (静かな位置から後ろ) だけが、次の発話の先頭として残る。
+        self.assertLess(
+            len(transcriber.audio_sources["last_sample"]),
+            FakeAudioSource.SAMPLE_RATE * FakeAudioSource.SAMPLE_WIDTH * 3,
+        )
 
     @patch("models.transcription.transcription_transcriber.checkWhisperWeight", return_value=False)
     def test_empty_queue_does_not_transcribe(self, _) -> None:
@@ -609,8 +624,11 @@ class TestVadSafetyNetMeasuresBufferedAudio(unittest.TestCase):
         self.assertTrue(transcriber.transcribeAudioQueue(audio_queue, ["Japanese"], ["Japan"]))
 
         transcriber._finalizeAndTranscribe.assert_called_once()
-        # 確定したのでリセットされている。
-        self.assertEqual(transcriber.audio_sources["last_sample"], b"")
+        # 上限で切った残り (静かな位置から後ろ) だけが、次の発話の先頭として残る。
+        self.assertLess(
+            len(transcriber.audio_sources["last_sample"]),
+            FakeAudioSource.SAMPLE_RATE * FakeAudioSource.SAMPLE_WIDTH * 3,
+        )
 
     @patch("models.transcription.transcription_transcriber.checkWhisperWeight", return_value=False)
     def test_a_short_segment_does_not_trip_the_safety_net(self, _) -> None:
@@ -666,7 +684,11 @@ class TestNonVadSafetyNetMeasuresBufferedAudio(unittest.TestCase):
         self.assertTrue(transcriber.transcribeAudioQueue(audio_queue, ["Japanese"], ["Japan"]))
 
         transcriber._finalizeAndTranscribe.assert_called_once()
-        self.assertEqual(transcriber.audio_sources["last_sample"], b"")
+        # 上限で切った残り (静かな位置から後ろ) だけが、次の発話の先頭として残る。
+        self.assertLess(
+            len(transcriber.audio_sources["last_sample"]),
+            FakeAudioSource.SAMPLE_RATE * FakeAudioSource.SAMPLE_WIDTH * 3,
+        )
 
     @patch("models.transcription.transcription_transcriber.checkWhisperWeight", return_value=False)
     def test_a_short_chunk_does_not_trip_the_safety_net(self, _) -> None:
