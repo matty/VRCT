@@ -167,6 +167,126 @@ class TestLocalWhisperProvider(unittest.TestCase):
 
         self.assertFalse(is_definitive)
 
+    # --- 長いクリップを最後まで文字起こしする ---
+
+    @staticmethod
+    def _speech(seconds: float, level: int = 8000) -> AudioData:
+        import numpy as np
+        samples = (np.sin(np.arange(int(seconds * 16000)) * 0.3) * level).astype("<i2")
+        return AudioData(samples.tobytes(), 16000, 2)
+
+    def _timed(self, text: str, start: float, end: float) -> SimpleNamespace:
+        return SimpleNamespace(text=text, avg_logprob=-0.1, no_speech_prob=0.1, start=start, end=end)
+
+    def _transcribe(self, provider, audio_data):
+        return provider.transcribe(
+            audio_data, "English", "United States",
+            avg_logprob=-0.8, no_speech_prob=0.6, no_repeat_ngram_size=0, force_language=True,
+        )
+
+    def test_asks_whisper_for_timestamps(self) -> None:
+        # タイムスタンプ無しだと、Whisper は複数の文を含むクリップを最初の文で
+        # 打ち切ることが多く、残りの音声は読み飛ばされる。
+        whisper_model = MagicMock()
+        whisper_model.transcribe.return_value = ([], SimpleNamespace(language="en", language_probability=1.0))
+        self._transcribe(LocalWhisperProvider(whisper_model), self._make_audio_data())
+        self.assertIs(whisper_model.transcribe.call_args.kwargs["without_timestamps"], False)
+
+    def test_resumes_after_whisper_stops_before_the_end_of_the_clip(self) -> None:
+        # 14 秒のクリップで、Whisper が 4 秒までしか出さずに終わった。
+        whisper_model = MagicMock()
+        whisper_model.transcribe.side_effect = [
+            ([self._timed("first part.", 0.0, 4.0)], SimpleNamespace(language="en", language_probability=1.0)),
+            ([self._timed(" second part.", 0.0, 9.8)], SimpleNamespace(language="en", language_probability=1.0)),
+        ]
+        text, _, _ = self._transcribe(LocalWhisperProvider(whisper_model), self._speech(14.0))
+
+        self.assertEqual(text, "first part. second part.")
+        self.assertEqual(whisper_model.transcribe.call_count, 2)
+        first_audio = whisper_model.transcribe.call_args_list[0].args[0]
+        second_audio = whisper_model.transcribe.call_args_list[1].args[0]
+        self.assertEqual(len(first_audio), 14 * 16000)
+        self.assertEqual(len(second_audio), 10 * 16000)  # 4 秒より後ろだけ
+
+    def test_does_not_resume_when_the_clip_was_covered(self) -> None:
+        whisper_model = MagicMock()
+        whisper_model.transcribe.return_value = (
+            [self._timed("all of it.", 0.0, 13.4)], SimpleNamespace(language="en", language_probability=1.0),
+        )
+        text, _, _ = self._transcribe(LocalWhisperProvider(whisper_model), self._speech(14.0))
+        self.assertEqual(text, "all of it.")
+        self.assertEqual(whisper_model.transcribe.call_count, 1)
+
+    def test_does_not_resume_into_silence(self) -> None:
+        # 4 秒話して、残りは無音。無音を文字起こしさせると存在しない文を作ることがある。
+        import numpy as np
+        speech = np.frombuffer(self._speech(4.0).get_raw_data(), dtype="<i2")
+        audio = AudioData(np.concatenate([speech, np.zeros(10 * 16000, dtype="<i2")]).tobytes(), 16000, 2)
+        whisper_model = MagicMock()
+        whisper_model.transcribe.return_value = (
+            [self._timed("only this.", 0.0, 4.0)], SimpleNamespace(language="en", language_probability=1.0),
+        )
+        text, _, _ = self._transcribe(LocalWhisperProvider(whisper_model), audio)
+        self.assertEqual(text, "only this.")
+        self.assertEqual(whisper_model.transcribe.call_count, 1)
+
+    def test_resumes_into_a_quieter_voice(self) -> None:
+        import numpy as np
+        loud = np.frombuffer(self._speech(4.0, level=8000).get_raw_data(), dtype="<i2")
+        quiet = np.frombuffer(self._speech(8.0, level=1600).get_raw_data(), dtype="<i2")  # -14 dB
+        audio = AudioData(np.concatenate([loud, quiet]).tobytes(), 16000, 2)
+        whisper_model = MagicMock()
+        whisper_model.transcribe.side_effect = [
+            ([self._timed("loud.", 0.0, 4.0)], SimpleNamespace(language="en", language_probability=1.0)),
+            ([self._timed(" quiet.", 0.0, 8.0)], SimpleNamespace(language="en", language_probability=1.0)),
+        ]
+        text, _, _ = self._transcribe(LocalWhisperProvider(whisper_model), audio)
+        self.assertEqual(text, "loud. quiet.")
+
+    def test_stops_resuming_when_nothing_more_comes_out(self) -> None:
+        whisper_model = MagicMock()
+        whisper_model.transcribe.side_effect = [
+            ([self._timed("first part.", 0.0, 4.0)], SimpleNamespace(language="en", language_probability=1.0)),
+            ([], SimpleNamespace(language="en", language_probability=1.0)),
+        ]
+        text, _, _ = self._transcribe(LocalWhisperProvider(whisper_model), self._speech(14.0))
+        self.assertEqual(text, "first part.")
+        self.assertEqual(whisper_model.transcribe.call_count, 2)
+
+    def test_resuming_is_bounded(self) -> None:
+        # 毎回 1 秒ずつしか進まなくても、やり直しは 3 回まで。
+        whisper_model = MagicMock()
+        whisper_model.transcribe.side_effect = lambda raw, **kwargs: (
+            [self._timed("x", 0.0, 1.0)], SimpleNamespace(language="en", language_probability=1.0),
+        )
+        text, _, _ = self._transcribe(LocalWhisperProvider(whisper_model), self._speech(14.0))
+        self.assertEqual(text, "xxxx")
+        self.assertEqual(whisper_model.transcribe.call_count, 4)
+
+    def test_resume_keeps_the_detected_language_when_none_was_forced(self) -> None:
+        whisper_model = MagicMock()
+        whisper_model.transcribe.side_effect = [
+            ([self._timed("annyeong", 0.0, 4.0)], SimpleNamespace(language="ko", language_probability=0.9, all_language_probs=[("ko", 0.9)])),
+            ([self._timed(" haseyo", 0.0, 9.9)], SimpleNamespace(language="ko", language_probability=1.0)),
+        ]
+        provider = LocalWhisperProvider(whisper_model)
+        text, _, index = provider.transcribe_candidates(
+            self._speech(14.0), [("English", "United States"), ("Korean", "South Korea")],
+            avg_logprob=-0.8, no_speech_prob=0.6, no_repeat_ngram_size=0,
+        )
+        self.assertEqual((text, index), ("annyeong haseyo", 1))
+        self.assertIsNone(whisper_model.transcribe.call_args_list[0].kwargs["language"])
+        self.assertEqual(whisper_model.transcribe.call_args_list[1].kwargs["language"], "ko")
+
+    def test_segments_without_end_times_are_not_resumed(self) -> None:
+        whisper_model = MagicMock()
+        whisper_model.transcribe.return_value = (
+            [_segment("no timing")], SimpleNamespace(language="en", language_probability=1.0),
+        )
+        text, _, _ = self._transcribe(LocalWhisperProvider(whisper_model), self._speech(14.0))
+        self.assertEqual(text, "no timing")
+        self.assertEqual(whisper_model.transcribe.call_count, 1)
+
     # --- transcribe_candidates: 候補言語が複数あるときの 1 回での文字起こし ---
 
     _CANDIDATES = [("English", "United States"), ("Korean", "South Korea"), ("Chinese Simplified", "China")]

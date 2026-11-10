@@ -17,6 +17,7 @@ VRCT の既存パイプラインは「フレーズ確定後にまとめて1回�
 """
 
 import math
+import numbers
 from typing import List, Optional, Protocol, Tuple
 
 import numpy as np
@@ -123,6 +124,18 @@ class GoogleProvider:
         return text, confidence, False
 
 
+# Whisper がクリップの途中で出力を打ち切ったとき (下の LocalWhisperProvider._decode)、
+# 残りの音声がこれ以上あれば、そこからもう一度文字起こしする。
+_WHISPER_RESUME_MIN_SECONDS = 1.5
+# 打ち切った後ろが、それまでの音声に比べてこれより小さければ (-20 dB) 無音と
+# みなして再開しない (無音を文字起こしさせると、存在しない文を作ることがある)。
+# 声の小さい別の話者 (-14 dB で実測) は再開の対象にする: Whisper が打ち切るのは、
+# 大きい声の後に小さい声が続くときが多い。
+_WHISPER_RESUME_MIN_LEVEL_RATIO = 0.1
+_WHISPER_MAX_RESUMES = 3
+_WHISPER_SAMPLE_RATE = 16000
+
+
 class LocalWhisperProvider:
     """既存のローカル (faster-whisper/CTranslate2) 呼び出しをそのまま包む。"""
 
@@ -146,19 +159,71 @@ class LocalWhisperProvider:
             no_speech_threshold=no_speech_prob,
             language=source_language,
             word_timestamps=False,
-            without_timestamps=True,
+            # タイムスタンプを出させる。以前は True (出させない) だった。
+            # その場合 Whisper は 1 つ目の文の終わりで出力をやめることが多く、
+            # faster-whisper は残りの音声を読み飛ばすので、複数の文を含む
+            # 長いクリップは先頭の文しか書き起こされなかった (実測: 15 秒の
+            # クリップが先頭 5 秒分だけになる。docs/streaming_output_2026-11-10.md)。
+            without_timestamps=False,
             task="transcribe",
             no_repeat_ngram_size=no_repeat_ngram_size,
         )
 
     @staticmethod
-    def _collect(segments, avg_logprob: float, no_speech_prob: float) -> str:
+    def _collect(segments, avg_logprob: float, no_speech_prob: float) -> Tuple[str, Optional[float]]:
+        """(採用したセグメントの本文, 最後のセグメントが終わる秒)。
+
+        秒はセグメントが 1 つも無ければ 0、終わりの時刻を持たないセグメント
+        (時刻を返さない実装) なら None。
+        """
         text = ""
+        covered: Optional[float] = 0.0
         for s in segments:
+            end = getattr(s, "end", None)
+            # numpy の float32 は float の派生ではないので numbers.Real で見る。
+            if isinstance(end, numbers.Real) and not isinstance(end, bool):
+                if covered is not None:
+                    covered = max(covered, float(end))
+            else:
+                covered = None
             if s.avg_logprob < avg_logprob or s.no_speech_prob > no_speech_prob:
                 continue
             text += s.text
-        return text
+        return text, covered
+
+    @staticmethod
+    def _continuesAfter(raw: np.ndarray, offset: int) -> bool:
+        """`offset` より後ろに、それまでと同じくらいの大きさの音が続いているか。"""
+        rest = raw[offset:]
+        if rest.size < _WHISPER_RESUME_MIN_SECONDS * _WHISPER_SAMPLE_RATE or offset <= 0:
+            return False
+        before = float(np.sqrt(np.mean(np.square(raw[:offset], dtype=np.float64))))
+        after = float(np.sqrt(np.mean(np.square(rest, dtype=np.float64))))
+        return before > 0.0 and after >= before * _WHISPER_RESUME_MIN_LEVEL_RATIO
+
+    def _decode(self, raw: np.ndarray, source_language: Optional[str], avg_logprob: float, no_speech_prob: float, no_repeat_ngram_size: int):
+        """`raw` を最後まで文字起こしする。(text, info) を返す。
+
+        Whisper は、まだ音声が続いているのに出力を終えることがある (文の途中から
+        始まるクリップで起きやすい)。faster-whisper はそこで残りを無音とみなして
+        読み飛ばす。最後のセグメントの終わりより後ろに音声が残っていれば、そこから
+        文字起こしをやり直してつなげる。
+        """
+        segments, info = self._start(raw, source_language, avg_logprob, no_speech_prob, no_repeat_ngram_size)
+        text, covered = self._collect(segments, avg_logprob, no_speech_prob)
+        language = source_language or getattr(info, "language", None)
+        offset = 0
+        for _ in range(_WHISPER_MAX_RESUMES):
+            if not covered:
+                # 何も出なかった (0)、または終わりの時刻が分からない (None)。
+                break
+            offset += int(covered * _WHISPER_SAMPLE_RATE)
+            if not self._continuesAfter(raw, offset):
+                break
+            segments, _ = self._start(raw[offset:], language, avg_logprob, no_speech_prob, no_repeat_ngram_size)
+            more, covered = self._collect(segments, avg_logprob, no_speech_prob)
+            text += more
+        return text, info
 
     def transcribe(
         self,
@@ -173,8 +238,7 @@ class LocalWhisperProvider:
     ) -> Tuple[str, float, bool]:
         raw = self._toFloat32(audio_data)
         source_language = transcription_lang[language][country]["Whisper"] if force_language else None
-        segments, info = self._start(raw, source_language, avg_logprob, no_speech_prob, no_repeat_ngram_size)
-        text = self._collect(segments, avg_logprob, no_speech_prob)
+        text, info = self._decode(raw, source_language, avg_logprob, no_speech_prob, no_repeat_ngram_size)
 
         is_definitive = force_language or transcription_lang[language][country]["Whisper"] == info.language
         return text, info.language_probability, is_definitive
@@ -212,8 +276,7 @@ class LocalWhisperProvider:
         """
         raw = self._toFloat32(audio_data)
         codes = [transcription_lang[language][country]["Whisper"] for language, country in candidates]
-        segments, info = self._start(raw, None, avg_logprob, no_speech_prob, no_repeat_ngram_size)
-        text = self._collect(segments, avg_logprob, no_speech_prob)
+        text, info = self._decode(raw, None, avg_logprob, no_speech_prob, no_repeat_ngram_size)
         index = codes.index(info.language) if info.language in codes else 0
         return text, info.language_probability, index
 
