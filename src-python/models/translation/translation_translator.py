@@ -7,12 +7,14 @@ try:
     from .translation_languages import translation_lang
     from .translation_utils import ctranslate2_weights
     from .translation_providers import TRANSLATION_PROVIDER_REGISTRY
+    from .translation_laughter import joinLaughter, splitLaughter
 except Exception:
     import sys
     sys.path.append(os_path.dirname(os_path.dirname(os_path.dirname(os_path.abspath(__file__)))))
     from translation_languages import translation_lang
     from translation_utils import ctranslate2_weights
     from translation_providers import TRANSLATION_PROVIDER_REGISTRY
+    from translation_laughter import joinLaughter, splitLaughter
 
 from utils import errorLogging, getBestComputeType
 
@@ -647,7 +649,15 @@ class Translator:
             case _:
                 return None
 
-    def translateCTranslate2Batch(self, message: str, source_language: str, target_languages: List[str], weight_type: str) -> List[Any]:
+    def translateCTranslate2Batch(
+        self,
+        message: str,
+        source_language: str,
+        target_languages: List[str],
+        weight_type: str,
+        source_name: Optional[str] = None,
+        target_names: Optional[List[str]] = None,
+    ) -> List[Any]:
         """Translate `message` into every language code in `target_languages`
         with a single ``translate_batch`` call.
 
@@ -657,11 +667,28 @@ class Translator:
         several target languages this replaces N sequential decodes - the
         lock serialises them anyway - with one batched decode.
 
+        `source_name` / `target_names` are the display names of the languages
+        ("Japanese", "English"). When given, chat laughter ("www", "草",
+        "ㅋㅋㅋ", "lol") is taken out before translating and written back the
+        way the target language writes it: the models invent sentences for it
+        otherwise (translation_laughter.py).
+
         Returns one entry per target: a string on success, False on failure.
         """
         results: List[Any] = [False] * len(target_languages)
         if not target_languages:
             return results
+
+        # (is_laughter, text) in message order. Without language names the
+        # whole message is one text piece, as before.
+        pieces = [(False, message)]
+        if source_name is not None and target_names is not None and len(target_names) == len(target_languages):
+            pieces = splitLaughter(message, source_name)
+        text_pieces = [text for is_laughter, text in pieces if not is_laughter]
+        if not text_pieces:
+            # Nothing but laughter: no need for the model at all.
+            return [joinLaughter(pieces, [], name) for name in target_names]
+
         with self._ctranslate2_lock:
             if self.is_loaded_ctranslate2_model is not True:
                 return results
@@ -671,13 +698,19 @@ class Translator:
                     return results
                 tokenizer = self.ctranslate2_tokenizer
                 tokenizer.src_lang = source_language
-                sentences = splitSentences(message)
-                sources = [tokenizer.convert_ids_to_tokens(tokenizer.encode(s)) for s in sentences]
-                if len(sentences) > 1:
-                    merged = mergeShortSentences(sentences, [len(s) for s in sources])
-                    if len(merged) != len(sentences):
-                        sentences = merged
-                        sources = [tokenizer.convert_ids_to_tokens(tokenizer.encode(s)) for s in sentences]
+                # Sentences of each text piece, tokenised. Short sentences are
+                # only merged with neighbours of the same piece.
+                piece_sources: List[List[List[str]]] = []
+                for text in text_pieces:
+                    sentences = splitSentences(text)
+                    sources = [tokenizer.convert_ids_to_tokens(tokenizer.encode(s)) for s in sentences]
+                    if len(sentences) > 1:
+                        merged = mergeShortSentences(sentences, [len(s) for s in sources])
+                        if len(merged) != len(sentences):
+                            sentences = merged
+                            sources = [tokenizer.convert_ids_to_tokens(tokenizer.encode(s)) for s in sentences]
+                    piece_sources.append(sources)
+                sources = [source for piece in piece_sources for source in piece]
 
                 batch_sources = []
                 batch_prefixes = []
@@ -701,18 +734,44 @@ class Translator:
                     for j in range(n):
                         target = outputs[i * n + j].hypotheses[0][1:]
                         decoded.append(tokenizer.decode(tokenizer.convert_tokens_to_ids(target)))
-                    results[i] = decoded[0] if n == 1 else joinSentences(decoded)
+                    translated_pieces = []
+                    offset = 0
+                    for piece in piece_sources:
+                        piece_decoded = decoded[offset:offset + len(piece)]
+                        offset += len(piece)
+                        translated_pieces.append(
+                            piece_decoded[0] if len(piece_decoded) == 1 else joinSentences(piece_decoded)
+                        )
+                    if len(pieces) == 1:
+                        results[i] = translated_pieces[0]
+                    else:
+                        results[i] = joinLaughter(pieces, translated_pieces, target_names[i])
             except Exception:
                 errorLogging()
                 results = [False] * len(target_languages)
         return results
 
-    def translateCTranslate2(self, message: str, source_language: str, target_language, weight_type: str) -> Any:
+    def translateCTranslate2(
+        self,
+        message: str,
+        source_language: str,
+        target_language,
+        weight_type: str,
+        source_name: Optional[str] = None,
+        target_name: Optional[str] = None,
+    ) -> Any:
         """Translate using a loaded CTranslate2 model.
 
         Returns a string on success or False on failure (keeps legacy behavior).
         """
-        return self.translateCTranslate2Batch(message, source_language, [target_language], weight_type)[0]
+        return self.translateCTranslate2Batch(
+            message,
+            source_language,
+            [target_language],
+            weight_type,
+            source_name=source_name,
+            target_names=None if target_name is None else [target_name],
+        )[0]
 
     @staticmethod
     def _cacheKey(translator_name: str, weight_type: str, source_language: str, target_language: str, message: str) -> Tuple:
@@ -754,7 +813,14 @@ class Translator:
             pending.append((i, key, tgt_code))
 
         if pending:
-            translated = self.translateCTranslate2Batch(message, source_code, [p[2] for p in pending], weight_type)
+            translated = self.translateCTranslate2Batch(
+                message,
+                source_code,
+                [p[2] for p in pending],
+                weight_type,
+                source_name=source_language,
+                target_names=[targets[p[0]][0] for p in pending],
+            )
             for (i, key, _), result in zip(pending, translated):
                 if isinstance(result, str) and (result.strip() or not message.strip()):
                     self._cache.put(key, result)
@@ -848,6 +914,7 @@ class Translator:
                 cached = self._cache.get(cache_key)
                 if cached is not None:
                     return cached
+            source_name, target_name = source_language, target_language
             source_language, target_language = self.getLanguageCode(translator_name, weight_type, target_country, source_language, target_language)
             match translator_name:
                 case "DeepL_API":
@@ -949,6 +1016,8 @@ class Translator:
                         source_language=source_language,
                         target_language=target_language,
                         weight_type=weight_type,
+                        source_name=source_name,
+                        target_name=target_name,
                         )
             if isinstance(result, str):
                 if not result.strip() and message.strip():
